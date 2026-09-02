@@ -1,0 +1,113 @@
+@import "tailwindcss";
+
+/* ------------------------------------------------------------------
+   FilRunway "instrument panel" theme.
+   Dark, high contrast, monospace-first. Tuned for a projector and for
+   screen recording: large type, hard edges, no low-contrast greys.
+   ------------------------------------------------------------------ */
+
+:root {
+  --void: #04070c;
+  --panel: #0a1119;
+  --panel-2: #0e1720;
+  --panel-3: #131f2b;
+  --line: #1b2836;
+  --line-bright: #2d4359;
+  --ink: #e9f3ff;
+  --ink-dim: #8299ae;
+  /* WCAG AA on --panel: 4.95:1 (was #4d6072 at 2.92:1, which failed).
+     Still a clear step below --ink-dim (6.43:1) and --ink (16.92:1). */
+  --ink-faint: #6d85a0;
+  --ok: #2ee6a8;
+  --warn: #ffb62e;
+  --crit: #ff4d63;
+  --accent: #4cc9ff;
+  --mock: #ffdf3d;
+}
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+
+  --color-void: var(--void);
+  --color-panel: var(--panel);
+  --color-panel-2: var(--panel-2);
+  --color-panel-3: var(--panel-3);
+  --color-line: var(--line);
+  --color-line-bright: var(--line-bright);
+  --color-ink: var(--ink);
+  --color-ink-dim: var(--ink-dim);
+  --color-ink-faint: var(--ink-faint);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-crit: var(--crit);
+  --color-accent: var(--accent);
+  --color-mock: var(--mock);
+}
+
+html {
+  color-scheme: dark;
+  background: var(--void);
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 50% -10%, #0b1a27 0%, transparent 70%),
+    repeating-linear-gradient(
+      0deg,
+      transparent 0px,
+      transparent 3px,
+      rgba(255, 255, 255, 0.012) 3px,
+      rgba(255, 255, 255, 0.012) 4px
+    ),
+    var(--void);
+  color: var(--ink);
+  font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Hairline grid used behind panels. */
+.grid-etch {
+  background-image:
+    linear-gradient(to right, rgba(76, 201, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(76, 201, 255, 0.05) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+@keyframes fr-blink {
+  0%, 45% { opacity: 1; }
+  55%, 100% { opacity: 0.15; }
+}
+.blink {
+  animation: fr-blink 1.6s steps(1, end) infinite;
+}
+
+@keyframes fr-ring {
+  0% { transform: scale(1); opacity: 0.55; }
+  100% { transform: scale(1.14); opacity: 0; }
+}
+.crit-ring {
+  animation: fr-ring 1.5s ease-out infinite;
+}
+
+@keyframes fr-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: none; }
+}
+.enter {
+  animation: fr-in 260ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .blink, .crit-ring, .enter { animation: none !important; }
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--panel); }
+::-webkit-scrollbar-thumb { background: var(--line-bright); border: 2px solid var(--panel); }
