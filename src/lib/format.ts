@@ -181,6 +181,15 @@ export interface DepositsTileInput {
   decisions: number;
   /** Where the totals are backed, or null when persistence is off. */
   journalPath: string | null;
+  /**
+   * Why there is no path, when the reason is a failure rather than a choice.
+   *
+   * Without this the tile says "persistence is off" for a journal that was
+   * switched off deliberately AND for one whose store rejected every write —
+   * and the second is the one a viewer has to be told about, because the
+   * figure above it is then this process's memory and nothing more.
+   */
+  journalError?: string | null;
 }
 
 /**
@@ -208,6 +217,7 @@ export function depositsTile({
   executed,
   decisions,
   journalPath,
+  journalError = null,
 }: DepositsTileInput): DepositsTile {
   if (mode === null) {
     return {
@@ -224,9 +234,12 @@ export function depositsTile({
 
   const value = toFixedString(depositedUsdfc, 0);
   const backing =
-    journalPath === null
-      ? "This session only: decision persistence is off, so nothing here survives a restart."
-      : `Whole recorded history for this mode, from the durable decision log at ${journalPath}.`;
+    journalPath !== null
+      ? `Whole recorded history for this mode, from the durable decision log at ${journalPath}.`
+      : journalError !== null
+        ? `This session only: the decision log FAILED and is no longer being written (${journalError}). ` +
+          "Nothing here survives a restart, and earlier records may be missing."
+        : "This session only: decision persistence is off, so nothing here survives a restart.";
 
   if (mode === "MOCK") {
     return {

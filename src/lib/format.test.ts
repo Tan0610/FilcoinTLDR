@@ -205,6 +205,28 @@ describe("depositsTile", () => {
     expect(tile.title).toContain("This session only");
   });
 
+  it("distinguishes a journal that FAILED from one that was switched off", () => {
+    // A bare null path reads as a deliberate configuration. It was not: the
+    // durable log stopped being written and nobody chose that, so the figure
+    // above it is this process's memory and may be missing earlier records.
+    const off = depositsTile({ ...simulated, mode: "LIVE", journalPath: null });
+    const failed = depositsTile({
+      ...simulated,
+      mode: "LIVE",
+      journalPath: null,
+      journalError: "Vercel Blob: Cannot use public access on a private store.",
+    });
+
+    expect(off.title).toContain("persistence is off");
+    expect(off.title).not.toContain("FAILED");
+
+    expect(failed.title).toContain("FAILED");
+    expect(failed.title).toContain("private store");
+    expect(failed.title).toContain("earlier records may be missing");
+    // And neither may claim the record is durable.
+    expect(failed.title).not.toContain("durable decision log at");
+  });
+
   it("keeps the plain treatment when a LIVE agent has executed nothing", () => {
     const tile = depositsTile({
       mode: "LIVE",

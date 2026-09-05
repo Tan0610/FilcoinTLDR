@@ -63,10 +63,39 @@
  * `uploadedAt` and `size`, so a refresh downloads only the tail segment that
  * actually changed.
  *
+ * PUBLIC vs PRIVATE STORES
+ * ------------------------
+ * `@vercel/blob` requires an explicit `access` on every write, and the store
+ * itself is configured one way or the other. Writing `access: "public"` to a
+ * store provisioned as private fails with
+ *
+ *   Vercel Blob: Cannot use public access on a private store.
+ *
+ * which this journal used to treat as any other write failure: disable, carry
+ * on in memory, and go on reporting a `blob:` path that nothing was being
+ * written to. That is the worst possible shape for an evidence log, so the
+ * access mode is no longer hardcoded. It is RESOLVED, in three steps, and the
+ * operator does not have to know which kind of store they connected:
+ *
+ *   1. `FILRUNWAY_BLOB_ACCESS` if set, for an operator who wants to pin it.
+ *   2. Otherwise observed from the store: the SDK addresses blobs at
+ *      `<store>.public.blob.vercel-storage.com` or `<store>.private....`, so
+ *      one `list()` of a non-empty store settles it exactly.
+ *   3. Otherwise guessed, and CORRECTED on the first write: an access-mismatch
+ *      rejection flips the mode and retries the same upload once. An empty
+ *      private store therefore costs one wasted request, not a dead journal.
+ *
+ * Reads take the same care. A private blob is not readable with a plain
+ * `fetch` — it needs the store's bearer token — so every read goes through the
+ * SDK's `get()`, with the per-object access taken from the URL `list()` just
+ * returned rather than from a guess.
+ *
  * CONFIGURATION
  * -------------
  *   BLOB_READ_WRITE_TOKEN   injected by Vercel when a Blob store is linked.
  *   FILRUNWAY_BLOB_PREFIX   optional; defaults to `filrunway/journal`.
+ *   FILRUNWAY_BLOB_ACCESS   optional; `public` or `private`. Auto-detected
+ *                           when unset, which is the intended configuration.
  *
  * With no token this journal is not selected at all and the filesystem journal
  * is used, so local development is untouched.
@@ -96,6 +125,23 @@ import type { AgentMode, Decision } from "./types";
 export const DEFAULT_BLOB_PREFIX = "filrunway/journal";
 export const BLOB_PREFIX_ENV = "FILRUNWAY_BLOB_PREFIX";
 export const BLOB_TOKEN_ENV = "BLOB_READ_WRITE_TOKEN";
+export const BLOB_ACCESS_ENV = "FILRUNWAY_BLOB_ACCESS";
+
+/**
+ * The access mode of the connected store.
+ *
+ * Not a property of a single object as far as this journal is concerned: a
+ * Vercel Blob store is provisioned public OR private and rejects writes of the
+ * other kind, so one value covers the whole prefix.
+ */
+export type BlobAccess = "public" | "private";
+
+/**
+ * Guessed first, corrected on contact. Public is the guess because it is what
+ * the default store is, and because the correction costs one request either
+ * way — see `isAccessMismatch`.
+ */
+export const DEFAULT_BLOB_ACCESS: BlobAccess = "public";
 
 /**
  * Lines per segment before a new part is started.
@@ -113,7 +159,7 @@ const CACHE_MAX_AGE_S = 60;
 /* ---------- injectable IO, so tests need no network and no token ---------- */
 
 export interface BlobPutOptions {
-  access: "public";
+  access: BlobAccess;
   addRandomSuffix: boolean;
   allowOverwrite: boolean;
   contentType: string;
@@ -127,10 +173,28 @@ export interface BlobListOptions {
   token: string;
 }
 
+/**
+ * What a read of one object needs.
+ *
+ * `token` is not optional. A private blob is served only to a request carrying
+ * the store's bearer credential, and the whole reason this interface exists is
+ * that the previous plain `fetch` had no way to present one.
+ */
+export interface BlobGetOptions {
+  access: BlobAccess;
+  token: string;
+  /**
+   * False to read past the CDN. Blob's minimum cache lifetime is 60s and a
+   * segment is rewritten on every append, so a cached copy of the tail is a
+   * copy that is missing the decision the caller came to read.
+   */
+  useCache: boolean;
+}
+
 export interface BlobIO {
   put(pathname: string, body: string, options: BlobPutOptions): Promise<PutBlobResult>;
   list(options: BlobListOptions): Promise<ListBlobResult>;
-  fetchText(url: string): Promise<string>;
+  fetchText(url: string, options: BlobGetOptions): Promise<string>;
 }
 
 /** The real thing. Imported lazily so nothing loads the SDK in mock mode. */
@@ -144,14 +208,91 @@ export function liveBlobIO(): BlobIO {
       const { list } = await import("@vercel/blob");
       return list(options);
     },
-    async fetchText(url) {
-      const response = await fetch(url, { cache: "no-store" });
-      if (!response.ok) {
-        throw new Error(`${response.status} ${response.statusText} reading ${url}`);
+    /**
+     * Read one object through the SDK rather than with a bare `fetch`.
+     *
+     * `get()` sets `authorization: Bearer <token>` and, for a private store,
+     * addresses the object on its authenticated host. A plain `fetch` of
+     * `blob.url` works only against a public store, which is the assumption
+     * that silently emptied this journal.
+     */
+    async fetchText(url, options) {
+      const { get } = await import("@vercel/blob");
+      const result = await get(url, {
+        access: options.access,
+        token: options.token,
+        useCache: options.useCache,
+      });
+      if (result === null) throw new Error(`404 Not Found reading ${url}`);
+      if (result.statusCode !== 200 || result.stream === null) {
+        throw new Error(`${result.statusCode} reading ${url}`);
       }
-      return response.text();
+      return new Response(result.stream as ReadableStream<Uint8Array>).text();
     },
   };
+}
+
+/**
+ * The access mode a blob URL implies, or null when the URL says nothing.
+ *
+ * The SDK builds object URLs as `<storeId>.<access>.blob.vercel-storage.com`,
+ * so a single listed object identifies the store's mode exactly. This is the
+ * cheap, non-destructive detection path: no probe write, no operator input.
+ */
+export function accessFromUrl(url: string): BlobAccess | null {
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+  if (!hostname.endsWith(".blob.vercel-storage.com")) return null;
+  if (hostname.includes(".private.")) return "private";
+  if (hostname.includes(".public.")) return "public";
+  return null;
+}
+
+/** The other one. */
+export function flipAccess(access: BlobAccess): BlobAccess {
+  return access === "public" ? "private" : "public";
+}
+
+/**
+ * Whether a rejected write is the store telling us we picked the wrong mode.
+ *
+ * The API answers a mismatched write with `bad_request` and a message the SDK
+ * passes through verbatim: "Cannot use public access on a private store. The
+ * store is configured with private access." Matched loosely, and on both
+ * directions, so a wording change degrades to "retry once with the other
+ * mode" rather than to "disable the journal".
+ */
+/**
+ * The URL and options one segment should be read with.
+ *
+ * The access comes from the object's own URL wherever it can, so a read never
+ * depends on the write path having guessed right. `useCache: false` is the
+ * private store's cache bust (the SDK appends `cache=0`); a public URL has no
+ * such lever, so the upload stamp does the same job there.
+ */
+function readArgs(
+  blob: { url: string; downloadUrl: string },
+  uploadedAt: number,
+  fallback: BlobAccess,
+  token: string,
+): [string, BlobGetOptions] {
+  const access = accessFromUrl(blob.url) ?? fallback;
+  const url =
+    access === "private"
+      ? blob.url
+      : `${blob.url}${blob.url.includes("?") ? "&" : "?"}ts=${uploadedAt}`;
+  return [url, { access, token, useCache: false }];
+}
+
+export function isAccessMismatch(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase();
+  if (message.includes("access on a private store")) return true;
+  if (message.includes("access on a public store")) return true;
+  return message.includes("store is configured with") && message.includes("access");
 }
 
 function errorMessage(error: unknown): string {
@@ -169,6 +310,11 @@ export interface BlobJournalOptions {
   token: string;
   prefix?: string;
   io?: BlobIO;
+  /**
+   * Pin the store's access mode. Omit — the intended configuration — to let the
+   * journal observe it from the store and correct itself on the first write.
+   */
+  access?: BlobAccess | null;
   /** Overridden in tests so segment keys are deterministic. */
   instanceId?: string;
   startedAt?: number;
@@ -202,6 +348,14 @@ export class BlobDecisionJournal implements DecisionJournal {
   private readonly startedAt: number;
   private readonly maxLines: number;
 
+  /** The store's access mode as currently believed. See `resolvedAccess`. */
+  private access: BlobAccess;
+  /**
+   * True once the mode is known rather than assumed — pinned by configuration,
+   * observed from a listed object, or proved by a write the store accepted.
+   */
+  private accessKnown: boolean;
+
   /** Lines this writer has appended to the current (unsealed) segment. */
   private lines: string[] = [];
   private part = 0;
@@ -225,6 +379,18 @@ export class BlobDecisionJournal implements DecisionJournal {
     this.instanceId = options.instanceId ?? randomId();
     this.startedAt = options.startedAt ?? Date.now();
     this.maxLines = options.segmentMaxLines ?? SEGMENT_MAX_LINES;
+    this.access = options.access ?? DEFAULT_BLOB_ACCESS;
+    this.accessKnown = options.access != null;
+  }
+
+  /**
+   * The store's access mode, and whether that is knowledge or a guess.
+   *
+   * Exposed because "which kind of store am I actually writing to?" is the
+   * question this journal used to answer wrongly and silently.
+   */
+  get resolvedAccess(): { access: BlobAccess; known: boolean } {
+    return { access: this.access, known: this.accessKnown };
   }
 
   /** The object this writer is currently appending to. */
@@ -235,9 +401,15 @@ export class BlobDecisionJournal implements DecisionJournal {
   /**
    * What `AgentStatus.journalPath` reports. A `blob:` scheme rather than a bare
    * path so nobody reads it as a file on a disk that does not exist.
+   *
+   * NULL once the journal has disabled itself. This is not decoration. The
+   * deposits tile says "from the durable decision log at <path>" whenever a
+   * path is present, so a disabled journal that kept reporting `blob:...` had
+   * the dashboard asserting durability for records that existed only in this
+   * process's memory — a claim strictly worse than admitting there is none.
    */
-  get path(): string {
-    return `blob:${this.key}`;
+  get path(): string | null {
+    return this.on ? `blob:${this.key}` : null;
   }
 
   get enabled(): boolean {
@@ -297,6 +469,9 @@ export class BlobDecisionJournal implements DecisionJournal {
   async loadAsync(scope: JournalScope = this.mode): Promise<JournalLoad> {
     try {
       const blobs = await this.listAll();
+      // One listed object settles what kind of store this is, for free, before
+      // any write has to find out the hard way.
+      this.observeAccess(blobs);
       const keep = new Map<string, SeenSegment>();
 
       await Promise.all(
@@ -312,9 +487,7 @@ export class BlobDecisionJournal implements DecisionJournal {
             keep.set(blob.pathname, previous);
             return;
           }
-          // The stamp busts the CDN copy of a segment that was just rewritten.
-          const url = `${blob.downloadUrl}${blob.downloadUrl.includes("?") ? "&" : "?"}ts=${uploadedAt}`;
-          const text = await this.io.fetchText(url);
+          const text = await this.io.fetchText(...readArgs(blob, uploadedAt, this.access, this.token));
           keep.set(blob.pathname, { text, uploadedAt, size: blob.size });
         }),
       );
@@ -330,6 +503,24 @@ export class BlobDecisionJournal implements DecisionJournal {
     // visible as a gap. Counted over every line seen, not just the in-scope ones.
     this.seq = Math.max(this.seq, result.read + result.skipped);
     return result;
+  }
+
+  /**
+   * Learn the store's access mode from anything it just listed.
+   *
+   * Free detection: no probe object is written and nothing is asked of the
+   * operator. Only an EMPTY store leaves the question open, and that case is
+   * settled by the first write's retry instead.
+   */
+  private observeAccess(blobs: ListBlobResult["blobs"]): void {
+    if (this.accessKnown) return;
+    for (const blob of blobs) {
+      const observed = accessFromUrl(blob.url);
+      if (observed === null) continue;
+      this.access = observed;
+      this.accessKnown = true;
+      return;
+    }
   }
 
   /** The key prefix of this writer's own segments. */
@@ -383,19 +574,42 @@ export class BlobDecisionJournal implements DecisionJournal {
     });
   }
 
+  /**
+   * Put one segment, correcting the access mode if the store says it is wrong.
+   *
+   * The retry runs at most once per upload and only for an access mismatch —
+   * any other rejection is a real failure and is rethrown for `upload()` to
+   * disable on. A store whose mode was guessed wrong therefore costs one
+   * rejected request, once, instead of a journal that turns itself off while
+   * still claiming to be on.
+   */
+  private async write(key: string, body: string): Promise<void> {
+    const options = {
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      contentType: "application/x-ndjson",
+      cacheControlMaxAge: CACHE_MAX_AGE_S,
+      token: this.token,
+    };
+    try {
+      await this.io.put(key, body, { access: this.access, ...options });
+      // The store accepted it, so the mode is no longer a guess.
+      this.accessKnown = true;
+    } catch (error) {
+      if (!isAccessMismatch(error)) throw error;
+      const corrected = flipAccess(this.access);
+      await this.io.put(key, body, { access: corrected, ...options });
+      this.access = corrected;
+      this.accessKnown = true;
+    }
+  }
+
   private async upload(): Promise<void> {
     if (!this.on || this.lines.length === 0) return;
     const key = this.key;
     const lines = [...this.lines];
     try {
-      await this.io.put(key, `${lines.join("\n")}\n`, {
-        access: "public",
-        addRandomSuffix: false,
-        allowOverwrite: true,
-        contentType: "application/x-ndjson",
-        cacheControlMaxAge: CACHE_MAX_AGE_S,
-        token: this.token,
-      });
+      await this.write(key, `${lines.join("\n")}\n`);
     } catch (error) {
       this.disable(error);
       return;
@@ -467,7 +681,11 @@ export async function readBlobJournal(
     };
   }
 
-  const found: { pathname: string; url: string }[] = [];
+  // An explicit pin wins; otherwise every object is read with the access its
+  // own URL implies, so the CLI needs no configuration to read either kind of
+  // store — and cannot be wrong about one of them.
+  const configured = blobAccess(env);
+  const found: { pathname: string; args: [string, BlobGetOptions] }[] = [];
   try {
     let cursor: string | undefined;
     do {
@@ -475,8 +693,10 @@ export async function readBlobJournal(
       for (const blob of page.blobs) {
         if (!blob.pathname.endsWith(".jsonl")) continue;
         const stamp = blob.uploadedAt.getTime();
-        const sep = blob.downloadUrl.includes("?") ? "&" : "?";
-        found.push({ pathname: blob.pathname, url: `${blob.downloadUrl}${sep}ts=${stamp}` });
+        found.push({
+          pathname: blob.pathname,
+          args: readArgs(blob, stamp, configured ?? DEFAULT_BLOB_ACCESS, token),
+        });
       }
       cursor = page.hasMore ? page.cursor : undefined;
     } while (cursor);
@@ -493,7 +713,7 @@ export async function readBlobJournal(
   const texts: string[] = [];
   for (const segment of found) {
     try {
-      texts.push(await io.fetchText(segment.url));
+      texts.push(await io.fetchText(...segment.args));
       files.push(`blob:${segment.pathname}`);
     } catch (error) {
       errors.push({ path: `blob:${segment.pathname}`, error: errorMessage(error) });
@@ -515,6 +735,19 @@ export function blobToken(env: DeploymentEnv = process.env): string | null {
 export function blobPrefix(env: DeploymentEnv = process.env): string {
   const raw = env[BLOB_PREFIX_ENV]?.trim().replace(/^\/+|\/+$/g, "");
   return raw ? raw : DEFAULT_BLOB_PREFIX;
+}
+
+/**
+ * An operator's explicit pin of the store's access mode, or null for auto.
+ *
+ * Null is the intended value. Anything unrecognised is also null rather than a
+ * thrown error or a silent "public": a typo must degrade to detection, not to
+ * the exact wrong guess this whole mechanism exists to survive.
+ */
+export function blobAccess(env: DeploymentEnv = process.env): BlobAccess | null {
+  const raw = env[BLOB_ACCESS_ENV]?.trim().toLowerCase();
+  if (raw === "public" || raw === "private") return raw;
+  return null;
 }
 
 /**
@@ -548,5 +781,6 @@ export function selectJournal(env: JournalEnv & DeploymentEnv = process.env): De
     mode,
     token: blobToken(env)!,
     prefix: blobPrefix(env),
+    access: blobAccess(env),
   });
 }

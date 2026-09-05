@@ -380,6 +380,7 @@ export function Dashboard({
     executed: totals ? totals.executed : sessionExecuted.length,
     decisions: totals ? totals.decisions : decisions.length,
     journalPath: status?.journalPath ?? null,
+    journalError: status?.journalError ?? null,
   });
 
   const stale = now > 0 && !connected;
@@ -510,7 +511,7 @@ export function Dashboard({
             pinned under it at its own small fixed height, so the left column
             (gauge + tiles + AGENT TRACE) is untouched and still fits 1366x768. */}
         <div className="flex min-h-0 flex-col gap-3">
-          <DecisionFeed decisions={decisions} />
+          <DecisionFeed decisions={decisions} journalError={status?.journalError ?? null} />
           <StoragePanel />
         </div>
       </div>

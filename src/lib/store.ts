@@ -131,6 +131,8 @@ class AgentStore {
 
   private lastRefreshAt = 0;
   private refreshing: Promise<void> | null = null;
+  /** So the failure is stated once, not once per decision, after it happens. */
+  private journalFailureReported = false;
 
   constructor(journal: DecisionJournal = selectJournal()) {
     this.journal = journal;
@@ -397,21 +399,48 @@ class AgentStore {
   private appendToJournal(decision: Decision): void {
     if (!this.journal.enabled) return;
     this.journal.append(decision);
-    if (!this.journal.enabled) {
-      const message =
-        `Decision log write failed (${this.journal.lastError}); continuing in memory only. ` +
-        "Decisions from here on will not survive a restart.";
-      this.publish({
-        id: this.nextEventId(),
-        at: Date.now(),
-        type: "log",
-        level: "warn",
-        message,
-      });
-      // Losing durability is not a passing event: every decision taken from
-      // here on is unbacked, so it has to stay on screen rather than scroll by.
-      this.addNotice({ key: "journal-write-failed", level: "warn", message });
-    }
+    this.checkJournalHealth();
+  }
+
+  /**
+   * Say so, once and permanently, if the journal has given up.
+   *
+   * WHY THIS IS NOT INLINE AFTER `append()`
+   * ---------------------------------------
+   * It used to be, and that is exactly how a dead journal stayed invisible.
+   * The filesystem journal writes inside `append()`, so a failure is known by
+   * the time it returns. The Blob journal does not: `append()` queues an
+   * upload and returns, and the store's rejection — an access mismatch, a
+   * suspended store, a network fault — only lands later, inside `flush()`. The
+   * check that ran immediately after `append()` therefore always saw an
+   * ENABLED journal and never fired, while every subsequent tick wrote to
+   * nothing and the dashboard went on reporting a `blob:` path.
+   *
+   * So the check runs wherever the answer can have changed: after the append
+   * (the synchronous journal's failure) AND after the flush (the remote one's).
+   * Idempotent, because both call it and a tick does both.
+   */
+  checkJournalHealth(): void {
+    if (this.journal.enabled) return;
+    // Configured off is not a failure; `journal-off` already covers that, and
+    // there is no error to report.
+    if (this.journal.lastError === null) return;
+    if (this.journalFailureReported) return;
+    this.journalFailureReported = true;
+
+    const message =
+      `Decision log write failed (${this.journal.lastError}); continuing in memory only. ` +
+      "Decisions from here on will not survive a restart.";
+    this.publish({
+      id: this.nextEventId(),
+      at: Date.now(),
+      type: "log",
+      level: "warn",
+      message,
+    });
+    // Losing durability is not a passing event: every decision taken from
+    // here on is unbacked, so it has to stay on screen rather than scroll by.
+    this.addNotice({ key: "journal-write-failed", level: "warn", message });
   }
 
   markTick(at: number): void {
@@ -430,6 +459,11 @@ class AgentStore {
    */
   async flushJournal(): Promise<void> {
     await this.journal.flush?.();
+    // The flush is where a remote journal's write failure actually surfaces,
+    // and `runTick()` awaits this before `getStatus()` reads the status the
+    // response carries — so a tick that failed to persist says so in the very
+    // response that reports the decision it failed to persist.
+    this.checkJournalHealth();
   }
 
   /* ---------- the safety cap's ledger ---------- */

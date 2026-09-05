@@ -310,8 +310,16 @@ function ActionCard({ decision }: { decision: Decision }) {
 
 export const DecisionFeed = memo(function DecisionFeed({
   decisions,
+  journalError = null,
 }: {
   decisions: Decision[];
+  /**
+   * Set when the durable log stopped being written. The count beside the
+   * heading is otherwise read as "this is the record", and an empty feed above
+   * a failed journal is indistinguishable from an agent that has simply not
+   * decided anything yet — which is the reading this panel must not allow.
+   */
+  journalError?: string | null;
 }) {
   const { ref: feedRef, showFade: feedFade } = useScrollFade<HTMLUListElement>(
     decisions.length,
@@ -321,12 +329,33 @@ export const DecisionFeed = memo(function DecisionFeed({
     <section className="flex min-h-0 flex-1 flex-col border border-line bg-panel">
       <header className="flex shrink-0 items-center justify-between border-b border-line px-4 py-2">
         <h2 className="text-[11px] tracking-[0.28em] text-ink-dim">DECISION LOG</h2>
-        <span className="tnum text-[11px] text-ink-faint">{decisions.length} entries</span>
+        {journalError === null ? (
+          <span className="tnum text-[11px] text-ink-faint">{decisions.length} entries</span>
+        ) : (
+          <span
+            className="tnum text-[11px] text-warn"
+            title={`The durable decision log is not being written (${journalError}). These entries are this process's memory only, and any earlier ones are not shown.`}
+          >
+            {decisions.length} entries &middot; NOT PERSISTED
+          </span>
+        )}
       </header>
+
+      {journalError !== null && (
+        // Above the list, not inside it: it qualifies every row below — and,
+        // when there are no rows, it is the only thing standing between an
+        // empty feed and the reading "the agent has decided nothing yet".
+        <p className="shrink-0 border-b border-line bg-panel-2 px-4 py-2 text-[11px] text-warn">
+          Durable decision log unavailable ({journalError}). Records shown are held in memory by
+          this process only; earlier decisions are not recoverable here.
+        </p>
+      )}
 
       {decisions.length === 0 ? (
         <p className="px-4 py-8 text-center text-[12px] text-ink-faint">
-          Waiting for the first sense &rarr; decide cycle&hellip;
+          {journalError === null
+            ? "Waiting for the first sense → decide cycle…"
+            : "No decisions in this process's memory — and the durable log is not being written, so this is not evidence that none were taken."}
         </p>
       ) : (
         <div className="relative flex min-h-0 flex-1 flex-col">

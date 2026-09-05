@@ -654,3 +654,143 @@ describe("getStatus", () => {
 afterEach(() => {
   vi.restoreAllMocks();
 });
+
+/* ---------- a journal that fails AFTER append returns ---------- */
+
+/**
+ * The failure mode that shipped, and why it was invisible.
+ *
+ * A filesystem journal writes inside `append()`, so a failure is known by the
+ * time it returns — and the store's check ran right there. The deployed
+ * journal is Blob-backed: `append()` queues an upload and returns, and the
+ * store's rejection (the provisioned store was PRIVATE and every write was
+ * sent as `public`) only landed later, inside `flush()`. The check therefore
+ * always saw an enabled journal, never fired, and the dashboard went on
+ * reporting a `blob:` path to a store that held zero objects.
+ *
+ * These pin the check to where the answer can actually have changed.
+ */
+describe("a journal that disables itself during flush, not during append", () => {
+  const REJECTION =
+    "Vercel Blob: Cannot use public access on a private store. " +
+    "The store is configured with private access.";
+
+  function lateFailingJournal(): DecisionJournal {
+    let queued = 0;
+    const journal: DecisionJournal = {
+      // A live-looking path, exactly as the broken deployment reported.
+      path: "blob:filrunway/journal/live/0001700000000-abc123-0000.jsonl",
+      mode: "MOCK",
+      enabled: true,
+      lastError: null,
+      // The remote journal's defining property: reads and writes are deferred.
+      synchronous: false,
+      load: (): JournalLoad => ({
+        decisions: [],
+        entries: [],
+        totals: store.totals,
+        byMode: { MOCK: 0, LIVE: 0 },
+        scope: "MOCK",
+        skipped: 0,
+        read: 0,
+      }),
+      // `append` SUCCEEDS. That is the whole point.
+      append: () => {
+        queued += 1;
+      },
+      flush: async () => {
+        if (queued === 0 || !journal.enabled) return;
+        const mutable = journal as {
+          enabled: boolean;
+          lastError: string | null;
+          path: string | null;
+        };
+        mutable.enabled = false;
+        mutable.lastError = REJECTION;
+        // As `BlobDecisionJournal.path` now does: stop naming a location that
+        // is not being written.
+        mutable.path = null;
+      },
+    };
+    return journal;
+  }
+
+  it("pins the failure to the dashboard instead of swallowing it", async () => {
+    store = resetStore(lateFailingJournal());
+    install({ snapshots: [snapshotWith(9.6)] });
+
+    const { decision } = await runTick();
+
+    // The agent carried on, as it must.
+    expect(decision.action).toBe("HOLD");
+
+    // And it SAID SO. This is the assertion that fails against the old code:
+    // the check ran only after `append()`, which never saw the failure.
+    const pinned = store.notices.find((n) => n.key === "journal-write-failed");
+    expect(pinned).toBeDefined();
+    expect(pinned!.level).toBe("warn");
+    expect(pinned!.message).toContain("private store");
+    // The trace carries it too, for anyone watching live.
+    const warned = eventsOfType(store, "log").filter(
+      (e) => e.level === "warn" && e.message.includes("private store"),
+    );
+    expect(warned).toHaveLength(1);
+  });
+
+  it("reports no path and a reason, in the very response that failed to persist", async () => {
+    store = resetStore(lateFailingJournal());
+    install({ snapshots: [snapshotWith(9.6)] });
+
+    await runTick();
+    // `runTick` awaits the flush before the route reads the status, so the
+    // response that carries the decision also carries the fact that the
+    // decision was not persisted.
+    const status = await getStatus();
+
+    expect(status.journalPath).toBeNull();
+    expect(status.journalError).toContain("private store");
+    expect(status.notices.some((n) => n.key === "journal-write-failed")).toBe(true);
+  });
+
+  it("says it once, however many ticks follow", async () => {
+    store = resetStore(lateFailingJournal());
+    install({ snapshots: [snapshotWith(9.6)] });
+
+    await runTick();
+    await runTick();
+    await getStatus();
+    await getStatus();
+
+    expect(store.notices.filter((n) => n.key === "journal-write-failed")).toHaveLength(1);
+    expect(
+      eventsOfType(store, "log").filter(
+        (e) => e.level === "warn" && e.message.includes("private store"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("says nothing when persistence is merely switched off", async () => {
+    // `journal-off` already covers the deliberate case, and a configuration
+    // choice is not a failure. Only an ERROR is worth pinning as one.
+    store = resetStore(nullJournal());
+    install({ snapshots: [snapshotWith(9.6)] });
+
+    await runTick();
+    const status = await getStatus();
+
+    expect(status.journalPath).toBeNull();
+    expect(status.journalError).toBeNull();
+    expect(store.notices.some((n) => n.key === "journal-write-failed")).toBe(false);
+  });
+
+  it("keeps journalError null while the journal is healthy", async () => {
+    store = resetStore(recordingJournal());
+    install({ snapshots: [snapshotWith(9.6)] });
+
+    await runTick();
+    const status = await getStatus();
+
+    expect(status.journalPath).toBe("(memory)");
+    expect(status.journalError).toBeNull();
+  });
+});

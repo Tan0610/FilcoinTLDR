@@ -234,6 +234,10 @@ async function readProof(epoch: number): Promise<ProofSnapshot> {
 export async function getStatus(): Promise<AgentStatus> {
   const store = getStore();
   const adapter = getChainAdapter();
+  // Idempotent, and the last place it can be caught: whatever route is being
+  // served, if the journal has given up by now the notice goes out with this
+  // status rather than waiting for the next tick to notice.
+  store.checkJournalHealth();
   // The interval ACTUALLY in force. Under the cron driver the local 15s
   // constant is not what schedules anything, and a NEXT TICK countdown running
   // to a deadline nothing observes would be a false reading on a dashboard
@@ -249,6 +253,10 @@ export async function getStatus(): Promise<AgentStatus> {
     // decisions a particular browser tab happens to be holding.
     totals: store.totals,
     journalPath: store.journal.enabled ? store.journal.path : null,
+    // A journal that turned itself off has to say so, not just stop reporting
+    // a path: "off by configuration" and "the store rejected every write" read
+    // identically as a bare null, and only one of them is a problem.
+    journalError: store.journal.enabled ? null : store.journal.lastError,
     // Standing disclosures, so a hydrate carries them even before the stream
     // connects — and so they cannot expire out of the trace. See `AgentNotice`.
     notices: store.notices,

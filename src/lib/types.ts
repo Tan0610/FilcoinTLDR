@@ -366,6 +366,17 @@ export interface AgentStatus {
    */
   journalPath: string | null;
   /**
+   * Why the journal is not writing, when it is not, or null.
+   *
+   * `journalPath === null` alone cannot distinguish the two ways persistence
+   * ends up off, and they are not the same fact: PERSISTENCE OFF is a
+   * deliberate configuration, PERSISTENCE FAILED means the durable record this
+   * project's autonomy claim rests on stopped being written and nobody chose
+   * that. A dashboard that renders both as "no path" is how a dead journal
+   * goes unnoticed, so the reason travels with the absence.
+   */
+  journalError: string | null;
+  /**
    * Standing disclosures for this process, oldest first. Empty when there is
    * nothing to disclose. See `AgentNotice` for why these are status rather
    * than trace lines.

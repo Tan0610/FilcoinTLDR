@@ -90,7 +90,7 @@ npm run decisions -- --remote      # read the DEPLOYED agent's journal out of Ve
 npm run decisions -- --split       # move historical MOCK records out of the LIVE journal (dry run)
 ```
 
-`scripts/decisions.ts` needs **no private key and no running server**. In its default form it reads the local JSONL files and needs no network either. `--remote` points it at the deployed agent's Blob journal instead (`readBlobJournal()`, `src/lib/blobJournal.ts:447`) and needs only `BLOB_READ_WRITE_TOKEN`, which `vercel env pull .env.local` writes — still no private key, still no server. Every other flag behaves identically against either source, because both go through the same parser and the same mode scoping.
+`scripts/decisions.ts` needs **no private key and no running server**. In its default form it reads the local JSONL files and needs no network either. `--remote` points it at the deployed agent's Blob journal instead (`readBlobJournal()`, `src/lib/blobJournal.ts:661`) and needs only `BLOB_READ_WRITE_TOKEN`, which `vercel env pull .env.local` writes — still no private key, still no server. Every other flag behaves identically against either source, because both go through the same parser and the same mode scoping.
 
 The bare form ends with a `transactions the agent authored` block that pairs every tx hash with its Filfox URL, the id of the decision that authored it, and the exact command to expand that decision.
 
@@ -154,7 +154,7 @@ Both are gitignored.
 
 **Leave `FILRUNWAY_DECISION_LOG` unset.** Setting it explicitly points *both* modes at that one file. That is still safe — every record is stamped and every read is scoped, so the dashboard and the CLI stay separated either way — but it re-mixes the two streams into one file, which is the state the per-mode default exists to avoid. Set it to `off` to disable persistence entirely and keep decisions in memory only.
 
-**2. Reads are scoped to the running mode.** `FileDecisionJournal.load()` (`src/lib/journal.ts:450`) defaults its scope to the journal's own mode, so a LIVE server replaying a file that also holds MOCK lines gets its own history back and nothing else. The Blob journal behaves identically: it concatenates its segments and hands the text to the same `parseJournal()` (`BlobDecisionJournal.load()`, `src/lib/blobJournal.ts:280`), so mode stamping, scoping, the `byMode` counts and the withheld-records disclosure are unchanged when the bytes move off disk. Crucially, a record whose `mode` field is missing or unrecognised reads as **MOCK** (`recordMode()`, `src/lib/journal.ts:299`): downgrading an unknown line is the only safe default, because a line must never be promoted into evidence by being unreadable. What the scope leaves out is counted (`byMode`) and disclosed rather than silently dropped.
+**2. Reads are scoped to the running mode.** `FileDecisionJournal.load()` (`src/lib/journal.ts:450`) defaults its scope to the journal's own mode, so a LIVE server replaying a file that also holds MOCK lines gets its own history back and nothing else. The Blob journal behaves identically: it concatenates its segments and hands the text to the same `parseJournal()` (`BlobDecisionJournal.load()`, `src/lib/blobJournal.ts:452`), so mode stamping, scoping, the `byMode` counts and the withheld-records disclosure are unchanged when the bytes move off disk. Crucially, a record whose `mode` field is missing or unrecognised reads as **MOCK** (`recordMode()`, `src/lib/journal.ts:299`): downgrading an unknown line is the only safe default, because a line must never be promoted into evidence by being unreadable. What the scope leaves out is counted (`byMode`) and disclosed rather than silently dropped.
 
 **3. The dashboard shows one mode and says which.** The AUTONOMOUS DEPOSITS tile and the decision feed are both fed from that scoped load, and `depositsTile()` (`src/lib/format.ts:197`) resolves the tile from the mode:
 
@@ -318,7 +318,7 @@ Four modules exist only because the project is deployable, and each answers one 
 
 `AgentStatus` carries `mode`, `address`, `tickIntervalMs`, `lastTickAt`, `nextTickAt`, plus `totals` (whole-history aggregates from the journal, **scoped to `mode`**), `journalPath` (where this mode's record is kept, or `null` when persistence is off or has disabled itself) and `notices` (the standing disclosures, oldest first, empty when there is nothing to disclose). `GET /api/decisions` serves the store's ring, which was hydrated under the same scope, so the feed a browser receives is single-mode by construction.
 
-Two of those fields are deployment-aware rather than constant. `tickIntervalMs` reports the schedule **actually in force** — 15,000 locally, 60,000 under the cron driver (`tickIntervalMs()`, `src/lib/deployment.ts:83`) — so the dashboard's NEXT TICK countdown never runs to a deadline nothing observes. `journalPath` is an absolute filesystem path locally and a `blob:filrunway/journal/<mode>/…` key on the deployment, prefixed so nobody reads it as a file on a disk that does not exist (`src/lib/blobJournal.ts:239`).
+Two of those fields are deployment-aware rather than constant. `tickIntervalMs` reports the schedule **actually in force** — 15,000 locally, 60,000 under the cron driver (`tickIntervalMs()`, `src/lib/deployment.ts:83`) — so the dashboard's NEXT TICK countdown never runs to a deadline nothing observes. `journalPath` is an absolute filesystem path locally and a `blob:filrunway/journal/<mode>/…` key on the deployment, prefixed so nobody reads it as a file on a disk that does not exist (`src/lib/blobJournal.ts:411`) — and **null** whenever the journal is not writing, with the reason in the adjacent `journalError`, so a dead journal cannot report a location as though it were live.
 
 ---
 
@@ -641,12 +641,12 @@ No key and no server, ever. The default form reads the local files and needs no 
 ### Other scripts
 
 ```bash
-npm run test         # 332 unit tests, 17 files
+npm run test         # 471 unit tests, 25 files
 npm run typecheck
 npm run lint
 ```
 
-Per file: `journal` 44, `demo` 27, `units` 27, `chain/synapse` 25 (pure helpers), `policy` 25, `agent` 23, `journalReport` 21, `format` 20, `spendGuard` 20, `tickAuth` 19, `decisions` 18, `blobJournal` 17, `deployment` 12, `agentSpendCap` 10, `api/stream/route` 9, `api/tick/route` 9, `agentSnapshot` 6.
+Per file: `journal` 44, `tickAuth` 37, `blobJournal` 31, `agent` 28, `demo` 27, `units` 27, `policy` 25, `chain/synapse` 25 (pure helpers), `format` 21, `journalReport` 21, `proof` 21, `spendGuard` 20, `api/squeeze/route` 20, `decisions` 18, `policyProof` 18, `deployment` 12, `squeeze` 11, `agentPrune` 10, `agentSpendCap` 10, `api/stream/route` 9, `api/tick/route` 9, `chain/mock` 8, `chain/proofDecode` 8, `agentSnapshot` 6, `eviction` 5.
 
 ---
 
@@ -707,18 +707,39 @@ Everything in ["Setup from zero"](#setup-from-zero) still applies — `FILRUNWAY
 | Variable | Set it? | What it does |
 |---|---|---|
 | `CRON_SECRET` | **Yes, before the first deploy** | The shared secret `/api/tick` requires, compared in constant time (`src/lib/tickAuth.ts:70`). Vercel's own name for it, so Vercel Cron sends `Authorization: Bearer $CRON_SECRET` on every scheduled invocation with no extra wiring. A deployment that requires the check and has no secret **refuses every tick with 503** rather than falling open. Generate with `openssl rand -hex 32`. |
-| `BLOB_READ_WRITE_TOKEN` | **Never by hand** | Injected when a Blob store is connected. Without it, a deployment's journal disables itself loudly and pins a warning, rather than silently writing to a `/tmp` that is about to be discarded. |
+| `BLOB_READ_WRITE_TOKEN` | **Never by hand** | Injected when a Blob store is connected. Without it, a deployment's journal disables itself loudly and pins a warning, rather than silently writing to a `/tmp` that is about to be discarded. Works with a **public or a private** store; you do not have to know which you connected. |
 | `FILRUNWAY_CRON_SCHEDULE` | Only off Pro | The cron expression compiled into `vercel.ts`. Default `* * * * *`. **Read at build time — changing it needs a redeploy.** |
 | `FILRUNWAY_CRON_INTERVAL_MS` | Optional | What the dashboard should believe the tick cadence is, in ms. Default 60,000. Set it when an external scheduler, not Vercel Cron, is driving the real cadence, so NEXT TICK counts down to something real. |
 | `FILRUNWAY_AGENT_DRIVER` | Rarely | Forces `interval` or `cron`, overriding the `VERCEL=1` detection. Its purpose is a self-hosted long-running deployment that wants to keep the in-process timer. Anything other than those two literals is ignored rather than trusted — a typo must not silently disable the agent. |
 | `FILRUNWAY_REQUIRE_TICK_AUTH` | No (tests only) | Forces the tick secret check on (`1`/`true`) or off (`0`/`false`) regardless of driver. |
 | `FILRUNWAY_BLOB_PREFIX` | Optional | Where in the Blob store the journal lives. Default `filrunway/journal`. Useful to give two deployments separate records in one store. |
+| `FILRUNWAY_BLOB_ACCESS` | **Leave unset** | Pins the store's access mode to `public` or `private`. Unset — the intended value — the journal works it out itself; see ["Public and private Blob stores"](#public-and-private-blob-stores) below. An unrecognised value falls back to detection rather than to a guess. |
 | `FILRUNWAY_MAX_DEPOSITS_24H` | Optional | Deposits the agent will allow itself inside the rolling window. Default `3`. |
 | `FILRUNWAY_MAX_DEPOSIT_USDFC_24H` | Optional | Total USDFC it will allow itself inside the window. Default `20`. |
 | `FILRUNWAY_SPEND_WINDOW_MS` | Optional | Length of that window. Default `86400000` (24h). |
 | `FILRUNWAY_SPEND_CAP` | Optional | `on` / `off`, forcing the cap regardless of mode. Unset, it is enforced in LIVE and not in MOCK. |
 
-**`FILRUNWAY_DECISION_LOG`: do not set it on Vercel.** It names a filesystem path, and a Function's filesystem is read-only apart from an ephemeral `/tmp`. On a deployment with a Blob store connected, `selectJournal()` (`src/lib/blobJournal.ts:541`) honours exactly one value of it — `off`, which disables persistence entirely — and ignores any path, because a path there would be either an error or a `/tmp` file discarded with the instance. Setting it to `off` on a deployment means the agent's decisions leave no record at all, which is the one thing this project's autonomy claim cannot survive. Leave it unset.
+#### Public and private Blob stores
+
+A Vercel Blob store is provisioned **public or private**, and `@vercel/blob` (2.8) requires an explicit `access` on every write. The two are not interchangeable: writing `access: "public"` to a private store is refused with
+
+```
+Vercel Blob: Cannot use public access on a private store. The store is configured with private access.
+```
+
+and a private object is not readable with a plain `fetch` of `blob.url` at all — it is served from `<store>.private.blob.vercel-storage.com` and only to a request carrying the store's bearer token, which is why every read goes through the SDK's `get()` rather than `fetch()`.
+
+**This once shipped hardcoded to `public` against a private store,** so every append was refused, the journal disabled itself, the agent silently fell back to in-memory only — and `journalPath` went on reporting `blob:filrunway/journal/…`, which the deposits tile renders as "from the durable decision log at …". The store held zero objects while the dashboard claimed a durable record. A journal that disables itself invisibly is worse than no journal, because the UI keeps making the claim.
+
+The access mode is therefore **resolved, not assumed** (`src/lib/blobJournal.ts`), and the operator does not have to know which kind of store they connected:
+
+1. `FILRUNWAY_BLOB_ACCESS`, if an operator has pinned it.
+2. Otherwise **observed** from the store: one `list()` of a non-empty store returns object URLs on the `.public.` or `.private.` host, which settles it exactly, with no probe write.
+3. Otherwise **corrected on first contact**: an access-mismatch rejection flips the mode and retries the same upload once. An empty store of the unexpected kind costs one refused request, once — not a dead journal.
+
+Any other rejection (a suspended store, a network fault) still disables the journal as before, so the retry cannot mask a real failure. And a disabled journal now reports `journalPath: null` plus a `journalError`, which pins a warning on the dashboard, drops the deposits tile's durability claim, and marks the DECISION LOG **NOT PERSISTED** — see ["Verifying the deployment"](#verifying-the-deployment) step 4.
+
+**`FILRUNWAY_DECISION_LOG`: do not set it on Vercel.** It names a filesystem path, and a Function's filesystem is read-only apart from an ephemeral `/tmp`. On a deployment with a Blob store connected, `selectJournal()` (`src/lib/blobJournal.ts:774`) honours exactly one value of it — `off`, which disables persistence entirely — and ignores any path, because a path there would be either an error or a `/tmp` file discarded with the instance. Setting it to `off` on a deployment means the agent's decisions leave no record at all, which is the one thing this project's autonomy claim cannot survive. Leave it unset.
 
 ### Verifying the deployment
 
@@ -745,7 +766,8 @@ Run these in order. Each one fails loudly if the step before it was skipped.
    - a dashed **`CRON DRIVEN`** chip where the RUN TICK button sits locally, with a tooltip explaining that the cycle is scheduled and the page would have to carry the secret to send one;
    - **no `RUN TICK NOW` button at all** — not a greyed-out one, because a disabled control invites a visitor to try;
    - a pinned `driver-cron` notice above the AGENT TRACE saying the agent is driven by a scheduled call to `/api/tick`, and a pinned `spend-cap` notice stating the deposit limits in force;
-   - `NEXT TICK` counting down from 60 seconds, not 15.
+   - `NEXT TICK` counting down from 60 seconds, not 15;
+   - **no** `journal-write-failed` notice, and no `NOT PERSISTED` marker beside the DECISION LOG heading. Either one means the durable record is not being written and everything on screen is this instance's memory; the reason is in `status.journalError` on `/api/decisions`.
 5. **Watch it act with nobody touching it.** Leave the page open, hands off, for about two minutes. Decisions appear on their own. This is the strongest single demonstration the project has, and it is stronger than the local one: locally, opening the dashboard is what starts the loop. Here, nothing you do in the browser can cause a tick — the page cannot even authenticate one.
 6. **Read the deployed record from your own machine.**
 
@@ -757,6 +779,19 @@ Run these in order. Each one fails loudly if the step before it was skipped.
    ```
 
    Same parser, same mode scoping, same evidence section as the local reader. The `file` row reads `blob:filrunway/journal/` instead of a path.
+
+7. **The store actually holds objects.** This is the only check that cannot be satisfied by a journal that has quietly given up, and it is the one that would have caught the private-store bug on the day it shipped. `journalPath` reporting `blob:…` is the agent's *intention*; the store's own listing is the *fact*.
+
+   ```bash
+   vercel env pull .env.local
+   node -e "import('@vercel/blob').then(async ({ list }) => {
+     const { blobs } = await list({ prefix: 'filrunway/journal/' });
+     console.log('total blobs:', blobs.length);
+     for (const b of blobs) console.log(' ', b.pathname, b.size + 'B', new URL(b.url).hostname);
+   })"
+   ```
+
+   **`total blobs` must be greater than zero** after a tick has run, and each hostname tells you which kind of store you have (`.private.` or `.public.`). Zero objects while the dashboard shows decisions means persistence is failing — check the pinned notice and `status.journalError` on `/api/decisions`.
 
 ### What is different on the deployment, honestly
 
@@ -906,7 +941,7 @@ Ordered roughly by how much they would matter in production.
 7. **`getStoredItems()` in live mode lists only this process's own uploads**, not an onchain enumeration — it is empty on a freshly started server. The onchain answer is `ChainAdapter.listStorage()`, which is what `/api/storage` and the dashboard's STORED DATA panel use; `bootstrap -- datasets` prints the same thing from the CLI.
 8. **The live gauge barely moves, and the demo timescale does not change that.** At roughly $0.008/day of real burn (0.240005 USDFC/month, measured live), a runway of thousands of days does not visibly count down over a two-minute video. `FILRUNWAY_DEMO_SCALE` scales thresholds, not the burn rate, so runway still falls at about a day per real day and no threshold is ever *fallen through* on camera. The visible drain is a mock-mode phenomenon. In live mode the decision moment comes from where the runway *is* relative to the scaled threshold, and from the flip back to HOLD that the deposit itself causes, not from watching a needle fall.
 9. **A restored decision card carries the rule label captured when the decision was taken.** This is within-mode staleness, not mode mixing, and it is pre-existing. `ruleLabel()` rewrites the day figure of the *catch-all* HOLD rule from the scale currently in force, but a rule that actually fired (`topup-7d`, `emergency-2d`) was scaled by `scaleRules()` at decision time and carries both its scaled `thresholdDays` and its `×N DEMO` suffix inside the stored `ruleFired.label`. So a mock session recorded at `×380` still displays `×380 DEMO` on its restored cards even when the current session runs at `×480`. That is correct as history — the card says what the agent actually compared against — but it does mean two cards in one feed can quote two different scales. The gauge badge, and every decision's own `reasoning` disclosure sentence, always state the scale that decision was taken at.
-10. **Not verified against a long-running live deployment.** 332 unit tests across 17 files cover the pure logic (policy, demo scaling, units, formatting, decision merging), the journal and its mode scoping, the reader-side mode policy in `src/lib/journalReport.ts`, the live adapter's helpers against the SDK's return shapes, the orchestration in `runTick()` against a scripted adapter, and every deployment-shaped module: driver selection (`deployment.test.ts`), the constant-time secret check and its fail-closed behaviour (`tickAuth.test.ts`), the Blob journal's segmenting, sealing, re-read avoidance and mode scoping against an injected IO fake (`blobJournal.test.ts`), and the spend cap both as pure arithmetic (`spendGuard.test.ts`) and end-to-end through `runTick()` (`agentSpendCap.test.ts`). `src/app/api/stream/route.test.ts` and `src/app/api/tick/route.test.ts` drive the real route handlers with real `Request` objects, so the backlog window, the frame encoding, the connect order, the 401/503 split and the authorise-before-anything ordering are tested rather than assumed — still unit-level, integration-lite, and no substitute for a live deployment. What they do not cover is sustained multi-hour live behaviour, real Vercel Cron delivery, cross-instance journal convergence under genuine concurrency, RPC flakiness under load, and provider-side upload failures, none of which have been exercised at length.
+10. **Not verified against a long-running live deployment.** 471 unit tests across 25 files cover the pure logic (policy, demo scaling, units, formatting, decision merging), the journal and its mode scoping, the reader-side mode policy in `src/lib/journalReport.ts`, the live adapter's helpers against the SDK's return shapes, the orchestration in `runTick()` against a scripted adapter, and every deployment-shaped module: driver selection (`deployment.test.ts`), the constant-time secret check and its fail-closed behaviour (`tickAuth.test.ts`), the Blob journal's segmenting, sealing, re-read avoidance and mode scoping against an injected IO fake (`blobJournal.test.ts`), and the spend cap both as pure arithmetic (`spendGuard.test.ts`) and end-to-end through `runTick()` (`agentSpendCap.test.ts`). `src/app/api/stream/route.test.ts` and `src/app/api/tick/route.test.ts` drive the real route handlers with real `Request` objects, so the backlog window, the frame encoding, the connect order, the 401/503 split and the authorise-before-anything ordering are tested rather than assumed — still unit-level, integration-lite, and no substitute for a live deployment. What they do not cover is sustained multi-hour live behaviour, real Vercel Cron delivery, cross-instance journal convergence under genuine concurrency, RPC flakiness under load, and provider-side upload failures, none of which have been exercised at length.
 
 ---
 
@@ -944,7 +979,7 @@ A note on the SDK version, because most code samples online are stale: 1.2.1 rem
 | `src/lib/journal.ts` | The durable append-only decision journal. The evidence file. Per-mode paths, mode-scoped reads. |
 | `src/lib/journalReport.ts` | Reader-side mode policy: `--mode` parsing, what counts as evidence, what a scope is hiding. Pure, 21 tests. |
 | `src/lib/blobJournal.ts` | The same append-only journal on Vercel Blob: per-writer segments, sealed at 50 lines, no shared-object read-modify-write. Also `readBlobJournal()`, which is what `npm run decisions -- --remote` reads, and `selectJournal()`, which picks disk or Blob. |
-| `src/lib/blobJournal.test.ts` | 17 tests against an injected IO fake — segmenting, sealing, re-read avoidance, mode scoping, selection, and the remote reader. No network, no token. |
+| `src/lib/blobJournal.test.ts` | 31 tests against an injected IO fake — segmenting, sealing, re-read avoidance, mode scoping, selection, the remote reader, and the public/private access resolution on both the write and read paths. No network, no token. |
 | `src/lib/deployment.ts` | Where this process is running and what that changes: the `interval` / `cron` driver, the real tick interval, whether a RUN TICK button may exist, whether the dashboard must poll. |
 | `src/lib/deployment.test.ts` | 12 tests pinning the driver decision, including that a typo in the override is ignored rather than trusted. |
 | `src/lib/tickAuth.ts` | The shared-secret check on `/api/tick`. Constant time, fail-closed, identical rejection text whatever went wrong. |
