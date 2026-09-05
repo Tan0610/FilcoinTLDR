@@ -60,6 +60,14 @@ export const config: VercelConfig = {
     "src/app/api/tick/route.ts": { maxDuration: 300 },
 
     /**
+     * The operator's squeeze submits a withdrawal and WAITS for it to be
+     * included before responding, because an unconfirmed withdrawal leaves the
+     * runway unchanged and the demo it exists to enable would look broken. Same
+     * Calibration inclusion times as a deposit, so the same budget.
+     */
+    "src/app/api/squeeze/route.ts": { maxDuration: 300 },
+
+    /**
      * The SSE feed is deliberately long-lived. It is closed by the platform at
      * `maxDuration` and the browser's EventSource reconnects on its own
      * (`retry: 3000` is sent on connect), so this bounds one connection rather

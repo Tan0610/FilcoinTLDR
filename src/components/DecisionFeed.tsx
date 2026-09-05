@@ -10,6 +10,7 @@ import {
   ruleLabel,
   truncateMiddle,
 } from "@/lib/format";
+import { isDepositAction } from "@/lib/policy";
 import type { Decision, DecisionOutcome } from "@/lib/types";
 import { SCROLL_FADE_STYLE, useScrollFade } from "@/lib/useScrollFade";
 
@@ -77,6 +78,25 @@ const DECLINE_STYLE = {
     footer:
       "Self-imposed limit — the agent declined to spend and will resume when the window " +
       "rolls. No operator action required, and no transaction was attempted.",
+  },
+  /**
+   * A prune the agent DECIDED on and was not permitted to carry out.
+   *
+   * Reached only when `outcome` is NO_ACTION: an executed prune is an
+   * ActionCard, because it did something. This card exists so the withheld case
+   * is visibly a decision rather than a gap — the agent worked out that a data
+   * set was not earning its cost and said so, and the deployment declined to
+   * let it act. Amber rather than red: nothing is broken and nobody needs to
+   * rush, the capability is simply not armed.
+   */
+  PRUNE_DATASET: {
+    color: "var(--warn)",
+    wash: "rgba(255, 182, 46, 0.08)",
+    pill: "NOT EXECUTED",
+    footer:
+      "Decision recorded, execution withheld — terminating a data set is irreversible, so " +
+      "it requires the FILRUNWAY_ENABLE_EVICTION opt-in, which is not set. No transaction " +
+      "was attempted and the data set is untouched.",
   },
 } as const;
 
@@ -262,9 +282,18 @@ function ActionCard({ decision }: { decision: Decision }) {
             {truncateMiddle(decision.txHash, 14, 10)}
           </a>
           <span className="text-ink-faint">&rarr; filfox</span>
-          {decision.ruleFired && (
+          {/* Only a deposit may print a USDFC figure here. A PRUNE_DATASET card
+              also carries `ruleFired` — the top-up it was taken instead of —
+              and printing that rule's amount beside a termination hash would
+              claim a deposit that never happened. */}
+          {decision.ruleFired && isDepositAction(decision.action) && (
             <span className="ml-auto tnum text-ink-dim">
               +{decision.ruleFired.topUpAmount} USDFC
+            </span>
+          )}
+          {decision.action === "PRUNE_DATASET" && decision.target && (
+            <span className="ml-auto tnum text-ink-dim">
+              data set #{decision.target.dataSetId} cut &middot; no deposit
             </span>
           )}
         </div>
@@ -318,7 +347,10 @@ export const DecisionFeed = memo(function DecisionFeed({
               // `BlockedCard` tells them apart — see `DECLINE_STYLE`.
               if (
                 decision.action === "INSUFFICIENT_FUNDS" ||
-                decision.action === "SAFETY_CAP"
+                decision.action === "SAFETY_CAP" ||
+                // A prune that was decided and withheld. An EXECUTED one falls
+                // through to ActionCard, where its tx link belongs.
+                (decision.action === "PRUNE_DATASET" && decision.outcome === "NO_ACTION")
               ) {
                 return <BlockedCard key={decision.id} decision={decision} />;
               }

@@ -53,6 +53,10 @@ export const ACTION_VAR: Record<DecisionAction, string> = {
   // nobody — the agent applied a limit it was given and will resume by itself.
   // Colouring the two the same would read as two alarms.
   SAFETY_CAP: "var(--warn)",
+  // The one irreversible action the agent can take, so it gets the alarm
+  // colour whether or not it executed: a viewer must never scan past a card
+  // that says a data set was cut.
+  PRUNE_DATASET: "var(--crit)",
 };
 
 export const ACTION_LABEL: Record<DecisionAction, string> = {
@@ -61,6 +65,10 @@ export const ACTION_LABEL: Record<DecisionAction, string> = {
   EMERGENCY_TOP_UP: "EMERGENCY TOP UP",
   INSUFFICIENT_FUNDS: "INSUFFICIENT FUNDS",
   SAFETY_CAP: "SAFETY CAP",
+  // "CUT" rather than "PRUNE": the label has to say what happens to the data,
+  // not name the mechanism. A judge reading one card must not have to work out
+  // that pruning a data set means storage stops being paid for.
+  PRUNE_DATASET: "CUT DATA SET",
 };
 
 /** 0x1234abcd...ef01 */

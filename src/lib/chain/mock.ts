@@ -13,6 +13,7 @@
  */
 
 import { EPOCHS_PER_DAY } from "../constants";
+import { classifyProofState, unreadableReading, type ProofReading } from "../proof";
 import type { RunwaySnapshot, StorageListing, StoredDataSet, StoredItem } from "../types";
 import { addDecimal, epochsFor, formatUnits, parseUnits, subDecimalFloor } from "../units";
 import type { ChainAdapter } from "./index";
@@ -58,7 +59,11 @@ function fakePieceCid(): string {
  * the one that flies the hazard stripe and the MOCK DATA badge.
  */
 const MOCK_PIECE_CID = "baga6ea4seaqhx7k2mvtjq3vnwtcyzldhjrn4z6i5dq3sy2wvbmkjxu4lqk7mgvy";
-const MOCK_DATA_SETS: StoredDataSet[] = [
+
+/** A data set before its (epoch-dependent) proof state is attached. */
+type MockDataSet = Omit<StoredDataSet, "proof">;
+
+const MOCK_DATA_SETS: MockDataSet[] = [
   {
     id: "30291",
     pdpId: "1607",
@@ -78,6 +83,88 @@ const MOCK_DATA_SETS: StoredDataSet[] = [
     pieceCids: [MOCK_PIECE_CID],
   },
 ];
+
+/**
+ * Which PDP proof story the mock tells.
+ *
+ * The eviction path is the one branch of the policy engine that cannot be
+ * rehearsed against a healthy live account — you would have to let real storage
+ * go unproven to see it — and it is also the one branch that destroys data. So
+ * it is made fully demoable HERE, where nothing can be lost:
+ *
+ *   healthy      (default) every data set proving on schedule. The agent tops
+ *                up and never proposes a cut. This is the local demo, unchanged.
+ *   delinquent   the SECOND data set is live, past its deadline and unproven.
+ *                A short runway then produces a real PRUNE_DATASET decision.
+ *   unreadable   the second data set's proof calls do not answer. This is the
+ *                RPC-hiccup rehearsal: the agent must treat it as UNKNOWN and
+ *                must NOT propose a cut. Getting this wrong is the failure the
+ *                whole design is built around, so it has a switch of its own.
+ *
+ * Read per call, not captured at module load, so a running dev server picks up
+ * a change to `.env.local` on its next restart without a code edit.
+ */
+export const MOCK_PROOF_ENV = "FILRUNWAY_MOCK_PROOF";
+export type MockProofMode = "healthy" | "delinquent" | "unreadable";
+
+export function mockProofMode(
+  env: Record<string, string | undefined> = process.env,
+): MockProofMode {
+  const raw = env[MOCK_PROOF_ENV]?.trim().toLowerCase();
+  if (raw === "delinquent" || raw === "unreadable") return raw;
+  return "healthy";
+}
+
+/** Plausible, self-consistent proof readings for one simulated data set. */
+export function mockProofReading(
+  dataSetId: string,
+  epoch: number,
+  mode: MockProofMode,
+  isLive: boolean,
+): ProofReading {
+  if (!isLive) {
+    // A terminated set: PDPVerifier says it is not live and there is no live
+    // proving period behind it. Read successfully, and not delinquent.
+    return {
+      dataSetId,
+      isLive: false,
+      lastProvenEpoch: null,
+      nextChallengeEpoch: null,
+      provingDeadline: 0,
+      provenThisPeriod: false,
+      errors: [],
+    };
+  }
+
+  if (mode === "unreadable") {
+    return unreadableReading(
+      dataSetId,
+      "simulated RPC failure (FILRUNWAY_MOCK_PROOF=unreadable)",
+    );
+  }
+
+  if (mode === "delinquent") {
+    return {
+      dataSetId,
+      isLive: true,
+      lastProvenEpoch: epoch - 5_760,
+      nextChallengeEpoch: null,
+      provingDeadline: epoch - 2_880,
+      provenThisPeriod: false,
+      errors: [],
+    };
+  }
+
+  return {
+    dataSetId,
+    isLive: true,
+    lastProvenEpoch: epoch - 120,
+    nextChallengeEpoch: epoch + 1_320,
+    provingDeadline: epoch + 2_760,
+    provenThisPeriod: true,
+    errors: [],
+  };
+}
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -101,8 +188,10 @@ export class MockChainAdapter implements ChainAdapter {
   private deposited = "0";
   /** Cumulative USDFC pulled out of the wallet. */
   private walletSpent = "0";
+  /** Cumulative USDFC the OPERATOR has withdrawn from Filecoin Pay. */
+  private withdrawn = "0";
   private items: StoredItem[] = [];
-  private dataSets: StoredDataSet[] = MOCK_DATA_SETS.map((set) => ({
+  private dataSets: MockDataSet[] = MOCK_DATA_SETS.map((set) => ({
     ...set,
     pieceCids: [...set.pieceCids],
   }));
@@ -130,7 +219,10 @@ export class MockChainAdapter implements ChainAdapter {
     const spent = formatUnits(spentUnits);
 
     const credited = addDecimal(INITIAL_FUNDS, this.deposited);
-    const fundsAvailable = subDecimalFloor(credited, spent);
+    // An operator withdrawal really removes funds here, exactly as
+    // `payments.withdraw` really removes them on chain: the simulated runway
+    // that follows is derived from the reduced balance, never faked.
+    const fundsAvailable = subDecimalFloor(credited, addDecimal(spent, this.withdrawn));
 
     const epochsRemaining = epochsFor(fundsAvailable, LOCKUP_RATE);
     const daysRemaining = epochsRemaining / EPOCHS_PER_DAY;
@@ -143,7 +235,12 @@ export class MockChainAdapter implements ChainAdapter {
       lockupCurrent: INITIAL_LOCKUP_CURRENT,
       epochsRemaining: Number.isFinite(epochsRemaining) ? epochsRemaining : 0,
       daysRemaining: Number.isFinite(daysRemaining) ? daysRemaining : 0,
-      walletUsdfc: subDecimalFloor(INITIAL_WALLET_USDFC, this.walletSpent),
+      // A withdrawal moves USDFC from Filecoin Pay back to the wallet; it does
+      // not destroy it, and the wallet figure has to show that.
+      walletUsdfc: addDecimal(
+        subDecimalFloor(INITIAL_WALLET_USDFC, this.walletSpent),
+        this.withdrawn,
+      ),
       walletFil: INITIAL_WALLET_FIL,
     };
   }
@@ -161,12 +258,59 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   async listStorage(): Promise<StorageListing> {
+    const takenAt = this.now();
+    const epoch = DEFAULT_BASE_EPOCH + this.elapsedEpochs(takenAt);
+    const mode = mockProofMode();
+
     return {
-      takenAt: this.now(),
-      dataSets: this.dataSets.map((set) => ({ ...set, pieceCids: [...set.pieceCids] })),
+      takenAt,
+      dataSets: this.dataSets.map((set, index) => ({
+        ...set,
+        pieceCids: [...set.pieceCids],
+        // Only the SECOND data set takes the configured story, so the
+        // interesting modes always produce a mixed account — one healthy set
+        // beside one bad one, which is the shape the policy engine has to
+        // choose within. A single uniformly-broken account would let a wrong
+        // implementation pass by accident.
+        proof: classifyProofState(
+          mockProofReading(set.id, epoch, index === 0 ? "healthy" : mode, set.isLive),
+          epoch,
+        ),
+      })),
       totalSizeBytes: this.dataSets.reduce((total, set) => total + (set.sizeBytes ?? 0), 0),
       items: [...this.items],
     };
+  }
+
+  /**
+   * Simulated termination. Marks the data set not live and stops counting its
+   * bytes, which is what the chain read would show once the rail winds down.
+   * Nothing is deleted from the simulation's history: the row stays visible,
+   * greyed, so a demo can see what was cut.
+   */
+  async terminateDataSet(dataSetId: string): Promise<{ txHash: string }> {
+    const target = this.dataSets.find((set) => set.id === dataSetId);
+    if (!target) {
+      throw new Error(`terminateDataSet: no data set ${dataSetId} on this account`);
+    }
+    if (!target.isLive) {
+      throw new Error(`terminateDataSet: data set ${dataSetId} is already terminated`);
+    }
+    await sleep(700 + Math.random() * 500);
+    this.dataSets = this.dataSets.map((set) =>
+      set.id === dataSetId ? { ...set, isLive: false } : set,
+    );
+    return { txHash: `0x${hex(32)}` };
+  }
+
+  /** Simulated operator withdrawal. Really lowers the simulated runway. */
+  async withdraw(amountUsdfc: string): Promise<{ txHash: string }> {
+    if (parseUnits(amountUsdfc) <= 0n) {
+      throw new Error(`withdraw: amount must be positive, got ${amountUsdfc} USDFC`);
+    }
+    await sleep(600 + Math.random() * 400);
+    this.withdrawn = addDecimal(this.withdrawn, amountUsdfc);
+    return { txHash: `0x${hex(32)}` };
   }
 
   async uploadFile(name: string, data: Uint8Array): Promise<StoredItem> {

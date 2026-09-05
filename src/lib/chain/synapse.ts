@@ -31,12 +31,14 @@
  */
 
 import type { Synapse } from "@filoz/synapse-sdk";
+import type { ContractFunctionParameters } from "viem";
 
 import {
   EPOCHS_PER_DAY,
   UNBOUNDED_DAYS,
   UNBOUNDED_EPOCHS,
 } from "../constants";
+import { classifyProofState, unreadableReading, type ProofReading } from "../proof";
 import type {
   RunwaySnapshot,
   StorageListing,
@@ -142,6 +144,80 @@ export function toRunwaySnapshot(input: SnapshotInput): RunwaySnapshot {
     daysRemaining,
     walletUsdfc: formatUnits(input.walletUsdfc, TOKEN_DECIMALS),
     walletFil: formatUnits(input.walletFil, TOKEN_DECIMALS),
+  };
+}
+
+/* ---------- PDP proof-state decoding (pure) ---------- */
+
+/** One entry of a `multicall({ allowFailure: true })` result, structurally. */
+export type CallOutcome =
+  | { status: "success"; result: unknown }
+  | { status: "failure"; error: unknown };
+
+/** A boolean return, or null when the call did not answer with one. */
+function readBool(outcome: CallOutcome | undefined): boolean | null {
+  if (outcome?.status !== "success") return null;
+  return typeof outcome.result === "boolean" ? outcome.result : null;
+}
+
+/**
+ * A `uint256` epoch return, or null when the call did not answer with one.
+ *
+ * Zero maps to null on purpose: PDPVerifier returns 0 for "never proven" and
+ * "no challenge scheduled", and Warm Storage returns 0 for a proving period
+ * that was never initialised. Treating those as epoch zero would make every
+ * such data set look infinitely overdue — which is precisely the class of bug
+ * that would have the agent terminate healthy storage.
+ */
+function readEpoch(outcome: CallOutcome | undefined): number | null {
+  if (outcome?.status !== "success") return null;
+  if (typeof outcome.result !== "bigint") return null;
+  const value = Number(outcome.result);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return Math.floor(value);
+}
+
+/** Why one decisive call did not answer, phrased for a decision's reasoning. */
+function callError(label: string, outcome: CallOutcome | undefined): string | null {
+  if (outcome === undefined) return `${label} was not returned by the node`;
+  if (outcome.status === "success") return null;
+  const raw = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+  return `${label} reverted or failed (${raw.split("\n")[0].slice(0, 160)})`;
+}
+
+/**
+ * The five contract results, in the order `PROOF_CALLS` builds them, decoded
+ * into the shape `classifyProofState` judges. Pure, so every partial-failure
+ * combination is testable without a chain.
+ *
+ * Order: dataSetLive, getDataSetLastProvenEpoch, getNextChallengeEpoch,
+ *        provenThisPeriod, provingDeadline.
+ */
+export function decodeProofOutcomes(
+  dataSetId: string,
+  outcomes: readonly CallOutcome[],
+): ProofReading {
+  const [live, lastProven, nextChallenge, proven, deadline] = outcomes;
+  const errors = [
+    callError("PDPVerifier.dataSetLive", live),
+    callError("WarmStorage.provenThisPeriod", proven),
+    callError("WarmStorage.provingDeadline", deadline),
+  ].filter((message): message is string => message !== null);
+
+  return {
+    dataSetId,
+    isLive: readBool(live),
+    lastProvenEpoch: readEpoch(lastProven),
+    nextChallengeEpoch: readEpoch(nextChallenge),
+    // `provingDeadline` of 0 means the proving period was never initialised,
+    // which `classifyProofState` must see as a real reading of "no deadline"
+    // rather than as an unread field — so it is preserved rather than nulled.
+    provingDeadline:
+      deadline?.status === "success" && typeof deadline.result === "bigint"
+        ? Number(deadline.result)
+        : null,
+    provenThisPeriod: readBool(proven),
+    errors,
   };
 }
 
@@ -437,9 +513,14 @@ export class SynapseChainAdapter implements ChainAdapter {
     const { dataSets, totalSizeBytes } = await this.listDataSets();
     const pdpIds = dataSets.map((set) => set.pdpVerifierDataSetId);
 
-    const [sizes, pieces] = await Promise.all([
+    // The epoch the proving deadlines are compared against MUST be a chain
+    // height read in the same breath as the deadlines, never a local clock.
+    const epoch = await this.currentEpoch();
+
+    const [sizes, pieces, proofs] = await Promise.all([
       this.dataSetSizes(pdpIds),
       Promise.all(pdpIds.map((id) => this.activePieceCids(id))),
+      this.readProofStates(pdpIds),
     ]);
 
     const listed: StoredDataSet[] = dataSets.map((set, index) => ({
@@ -450,6 +531,14 @@ export class SynapseChainAdapter implements ChainAdapter {
       isLive: set.isLive,
       withCDN: set.withCDN,
       pieceCids: pieces[index] ?? [],
+      proof: classifyProofState(
+        proofs[index] ??
+          unreadableReading(
+            set.pdpVerifierDataSetId.toString(),
+            "no proof reading was taken for this data set",
+          ),
+        epoch,
+      ),
     }));
 
     return {
@@ -458,6 +547,185 @@ export class SynapseChainAdapter implements ChainAdapter {
       totalSizeBytes: Number(totalSizeBytes),
       items: [...this.items],
     };
+  }
+
+  /**
+   * The chain height, or 0 when it could not be read.
+   *
+   * 0 is not a fallback that lets anything through: `classifyProofState`
+   * rejects a non-positive epoch outright and marks every proof state UNKNOWN,
+   * which is the correct answer when we cannot say what time it is on chain.
+   */
+  private async currentEpoch(): Promise<number> {
+    try {
+      const { synapse } = await this.session();
+      const { getBlockNumber } = await import("viem/actions");
+      const height = await this.call("getBlockNumber", () =>
+        getBlockNumber(synapse.readClient, { cacheTime: 0 }),
+      );
+      return Number(height);
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * PDP proof state for each data set, positionally.
+   *
+   * WHAT IS ACTUALLY CALLED, IN SDK 1.2.1
+   * -------------------------------------
+   * `@filoz/synapse-sdk` exposes no proof-state accessor at all, and
+   * `@filoz/synapse-core/pdp-verifier` exports functions for only two of the
+   * five reads we need (`dataSetLive`, `getNextChallengeEpoch`). All five are
+   * in the ABIs the SDK already carries on its chain definition, so they are
+   * read directly from `synapse.chain.contracts.pdp` and `.fwssView` — the same
+   * addresses and ABIs the SDK's own helpers resolve to, never hardcoded:
+   *
+   *   PDPVerifier           dataSetLive, getDataSetLastProvenEpoch,
+   *                         getNextChallengeEpoch
+   *   WarmStorageStateView  provenThisPeriod, provingDeadline
+   *
+   * One `multicall` per data set with `allowFailure: true`, so a single
+   * reverting read degrades that ONE field to unknown instead of losing the
+   * whole account's proof state — and so one bad data set cannot make a healthy
+   * neighbour look unreadable.
+   *
+   * Every failure path here produces an UNREADABLE reading, never a delinquent
+   * one. That is the invariant the eviction path rests on; see `src/lib/proof.ts`.
+   */
+  private async readProofStates(pdpIds: bigint[]): Promise<ProofReading[]> {
+    if (pdpIds.length === 0) return [];
+
+    let synapse: Synapse;
+    let multicall: typeof import("viem/actions").multicall;
+    try {
+      ({ synapse } = await this.session());
+      ({ multicall } = await import("viem/actions"));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return pdpIds.map((id) =>
+        unreadableReading(id.toString(), scrub(message, this.privateKey)),
+      );
+    }
+
+    const pdp = synapse.chain.contracts.pdp;
+    const view = synapse.chain.contracts.fwssView;
+
+    return Promise.all(
+      pdpIds.map(async (id) => {
+        const dataSetId = id.toString();
+        const contracts: ContractFunctionParameters[] = [
+          { address: pdp.address, abi: pdp.abi, functionName: "dataSetLive", args: [id] },
+          {
+            address: pdp.address,
+            abi: pdp.abi,
+            functionName: "getDataSetLastProvenEpoch",
+            args: [id],
+          },
+          {
+            address: pdp.address,
+            abi: pdp.abi,
+            functionName: "getNextChallengeEpoch",
+            args: [id],
+          },
+          {
+            address: view.address,
+            abi: view.abi,
+            functionName: "provenThisPeriod",
+            args: [id],
+          },
+          { address: view.address, abi: view.abi, functionName: "provingDeadline", args: [id] },
+        ];
+
+        try {
+          const outcomes = await this.call("pdp.proofState", () =>
+            multicall(synapse.readClient, { allowFailure: true, contracts }),
+          );
+          return decodeProofOutcomes(dataSetId, outcomes as readonly CallOutcome[]);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return unreadableReading(dataSetId, scrub(message, this.privateKey));
+        }
+      }),
+    );
+  }
+
+  /**
+   * Terminate the Warm Storage payment rail for one data set. DESTRUCTIVE.
+   *
+   * WHICH TERMINATION CALL, AND WHY
+   * -------------------------------
+   * SDK 1.2.1 offers two, and they are not interchangeable:
+   *
+   *   StorageManager.terminateService   provider-relayed, IMMEDIATE. It asks
+   *     the service provider's PDP endpoint to submit the termination, then
+   *     polls it. It settles the payer's account in full, and it refuses
+   *     outright — `terminateServiceFlow` throws before signing — when the
+   *     account cannot settle its lockup (`debt > 0n`).
+   *
+   *   WarmStorageService.terminateService   direct ON-CHAIN. One transaction
+   *     against the Warm Storage contract; the service and its payments run to
+   *     the end of the lockup period and wind down from there.
+   *
+   * This agent uses the ON-CHAIN one, deliberately:
+   *
+   *   1. The provider-relayed path fails precisely when this decision fires.
+   *      The agent proposes a cut because its runway is SHORT — the state
+   *      closest to `debt > 0`. An eviction path that refuses to run in a
+   *      funding crisis is not an eviction path.
+   *   2. It cannot hang on a service provider being unreachable. An unattended
+   *      agent must not have a destructive action that blocks on someone else's
+   *      HTTP endpoint, and a data set that has stopped proving is exactly the
+   *      one whose provider is most likely to be down.
+   *   3. It is one submitted transaction returning a hash, so it reuses
+   *      `deposit()`'s SUBMITTED -> CONFIRMED tracking unchanged.
+   *   4. Winding down over the lockup period rather than settling instantly is
+   *      the gentler of the two, which is the right default for the only
+   *      irreversible thing this agent can do.
+   */
+  async terminateDataSet(dataSetId: string): Promise<{ txHash: string }> {
+    let id: bigint;
+    try {
+      id = BigInt(dataSetId);
+    } catch {
+      throw new Error(`terminateDataSet: ${JSON.stringify(dataSetId)} is not a data set id`);
+    }
+    if (id < 0n) {
+      throw new Error(`terminateDataSet: data set id must not be negative, got ${dataSetId}`);
+    }
+
+    const { synapse } = await this.session();
+    const { WarmStorageService } = await import("@filoz/synapse-sdk/warm-storage");
+    const warmStorage = new WarmStorageService({
+      client: synapse.client,
+      readClient: synapse.readClient,
+    });
+
+    const txHash = await this.call("warmStorage.terminateService", () =>
+      warmStorage.terminateService({ dataSetId: id }),
+    );
+    return { txHash };
+  }
+
+  /**
+   * Move USDFC OUT of Filecoin Pay and back to the agent's own wallet.
+   *
+   * The operator's squeeze control, and nothing the agent itself ever calls.
+   * `payments.withdraw` reverts if the amount exceeds the unlocked balance, so
+   * the bound is checked before we get here (`src/lib/squeeze.ts`) and a
+   * refusal is a 400 rather than a reverted transaction on the explorer.
+   */
+  async withdraw(amountUsdfc: string): Promise<{ txHash: string }> {
+    const amount = parseUnits(amountUsdfc, TOKEN_DECIMALS);
+    if (amount <= 0n) {
+      throw new Error(`withdraw: amount must be positive, got ${amountUsdfc} USDFC`);
+    }
+
+    const { synapse } = await this.session();
+    const txHash = await this.call("payments.withdraw", () =>
+      synapse.payments.withdraw({ amount }),
+    );
+    return { txHash };
   }
 
   /** Bytes per data set, positionally. `null` for any read that failed. */

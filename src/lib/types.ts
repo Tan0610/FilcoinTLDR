@@ -38,6 +38,79 @@ export interface RunwaySnapshot {
   walletUsdfc: string;
   /** FIL sitting in the agent's wallet, i.e. whether it can still pay gas. */
   walletFil: string;
+  /**
+   * PDP proof state for every data set the burn rate is paying for, as read at
+   * this epoch. See `ProofSnapshot`.
+   *
+   * OPTIONAL, and the three states are all different:
+   *   - `undefined` — no proof reading was attached to this snapshot (a bare
+   *     gauge read, an older journalled decision, a test fixture). The policy
+   *     engine says nothing about proofs.
+   *   - `{ dataSets: [] }` — read successfully; the account pays for nothing.
+   *   - populated — read successfully; judge each entry on its own `readable`.
+   *
+   * Never a summary of "how healthy storage is": it is the raw per-data-set
+   * reading, and `unreadable` is carried beside `delinquent` precisely so a
+   * failed read can never be collapsed into a delinquency.
+   */
+  proof?: ProofSnapshot;
+}
+
+/**
+ * One data set's PDP proof obligation, as read from PDPVerifier + the Warm
+ * Storage state view.
+ *
+ * THE ONE RULE THIS TYPE EXISTS TO ENFORCE
+ * ----------------------------------------
+ * `isDelinquent` is true ONLY when every field the judgement rests on was
+ * actually returned by a contract call. An RPC timeout, a reverted read, a
+ * proving period that was never initialised — all of those set `readable:
+ * false` and `isDelinquent: false`, with `unknownReason` saying which call did
+ * not answer. The agent may terminate a data set on this flag, so treating an
+ * unread field as a missed proof would mean destroying data on a network
+ * hiccup. See `classifyProofState()` in `src/lib/proof.ts`.
+ */
+export interface DataSetProofState {
+  /** PDPVerifier / Warm Storage data set id. The same id in SDK 1.2.1. */
+  dataSetId: string;
+  /** `PDPVerifier.dataSetLive`. */
+  isLive: boolean | null;
+  /** `PDPVerifier.getDataSetLastProvenEpoch`. */
+  lastProvenEpoch: number | null;
+  /** `PDPVerifier.getNextChallengeEpoch`. Informational only. */
+  nextChallengeEpoch: number | null;
+  /** `FilecoinWarmStorageServiceStateView.provingDeadline`. */
+  provingDeadline: number | null;
+  /** `FilecoinWarmStorageServiceStateView.provenThisPeriod`. */
+  provenThisPeriod: boolean | null;
+  /** True when every field the delinquency judgement needs was read. */
+  readable: boolean;
+  /** Why the state is not decisive. Null if and only if `readable`. */
+  unknownReason: string | null;
+  /** Epochs past `provingDeadline` at the reading epoch, or null when unknown. */
+  epochsOverdue: number | null;
+  /** Live, past its proving deadline, unproven this period — and READ. */
+  isDelinquent: boolean;
+}
+
+/** Every data set's proof state at one chain epoch. */
+export interface ProofSnapshot {
+  /** The chain epoch the deadlines were compared against. */
+  epoch: number;
+  dataSets: DataSetProofState[];
+  /** Data sets whose decisive proof fields could not be read. */
+  unreadable: number;
+  /** Data sets confirmed delinquent. Never includes an unreadable one. */
+  delinquent: number;
+  /**
+   * Why NO per-data-set state exists at all — the storage listing itself
+   * failed. Null on a successful reading.
+   *
+   * Distinct from `dataSets: []`, which is the very different claim that the
+   * account pays for nothing. A decision must never say "no data sets" when
+   * what actually happened is "we could not look".
+   */
+  listingError?: string | null;
 }
 
 /** What a policy rule is allowed to ask for. */
@@ -59,7 +132,43 @@ export type PolicyAction = "TOP_UP" | "EMERGENCY_TOP_UP" | "HOLD";
  * Both carry outcome NO_ACTION. Neither is a failed transaction: recognising a
  * constraint and saying so is a decision, and it is recorded as one.
  */
-export type DecisionAction = PolicyAction | "INSUFFICIENT_FUNDS" | "SAFETY_CAP";
+export type DecisionAction =
+  | PolicyAction
+  | "INSUFFICIENT_FUNDS"
+  | "SAFETY_CAP"
+  | "PRUNE_DATASET";
+
+/**
+ * What a `PRUNE_DATASET` decision is about — the data set the agent judged not
+ * worth paying for, and the arithmetic behind cutting it instead of funding it.
+ *
+ * Carried on the Decision (and therefore journalled with it) so the record of
+ * an irreversible action names its subject and its justification, rather than
+ * leaving both buried in prose.
+ */
+export interface PruneTarget {
+  /** The data set the agent decided to stop paying for. */
+  dataSetId: string;
+  /** Epochs past its proving deadline at the deciding reading. */
+  epochsOverdue: number;
+  /** Live data sets at the deciding reading, this one included. */
+  liveDataSets: number;
+  /** The top-up the rule called for and which was NOT made on this reading. */
+  deferredTopUpAmount: string;
+  /**
+   * That top-up re-sized over the rails that survive the cut, pro-rata by rail
+   * COUNT. A bound, not a measurement: Filecoin Pay reports one aggregate
+   * `lockupRatePerEpoch` for the account and no per-rail split, so the exact
+   * post-termination rate is only knowable from the next reading. The decision
+   * text says so wherever this number appears.
+   */
+  resizedTopUpAmount: string;
+  /**
+   * False when this deployment's opt-in is off. The decision is still made and
+   * still recorded; only its execution is withheld. See `src/lib/eviction.ts`.
+   */
+  executionEnabled: boolean;
+}
 
 /**
  * One line of the agent's policy. Rules are evaluated lowest-threshold-first;
@@ -89,6 +198,8 @@ export interface Decision {
   outcome: DecisionOutcome;
   txHash?: string;
   error?: string;
+  /** Present only on `PRUNE_DATASET`. See `PruneTarget`. */
+  target?: PruneTarget;
 }
 
 /**
@@ -215,6 +326,15 @@ export interface StoredDataSet {
    * Empty means none were readable, NEVER that a placeholder should be shown.
    */
   pieceCids: string[];
+  /**
+   * PDP proof obligation for this data set.
+   *
+   * Lives here rather than on a separate read so the STORED DATA panel and the
+   * policy engine can never disagree about whether a data set is proving: the
+   * agent builds `RunwaySnapshot.proof` out of exactly these values. See
+   * `proofSnapshotFrom()` in `src/lib/proof.ts`.
+   */
+  proof: DataSetProofState;
 }
 
 /** Everything the agent is currently paying to store. */
@@ -280,6 +400,27 @@ export interface TickResponse {
    * tick it just asked for. See `runTick()` in `src/lib/agent.ts`.
    */
   coalesced: boolean;
+}
+
+/**
+ * The result of the operator's SQUEEZE RUNWAY control.
+ *
+ * NOT a decision, and deliberately not shaped like one. A withdrawal from
+ * Filecoin Pay back to the wallet is a HUMAN action that manufactures the
+ * crisis; the agent's response to it on the next tick is the autonomous part.
+ * Conflating the two would be the single most misleading thing this dashboard
+ * could do, so the squeeze produces its own envelope, its own trace lines and
+ * no `Decision` at all.
+ */
+export interface SqueezeResponse {
+  /** USDFC actually withdrawn, after clamping to the configured bound. */
+  amountUsdfc: string;
+  txHash: string;
+  explorerUrl: string;
+  /** The reading taken immediately before the withdrawal. */
+  before: RunwaySnapshot;
+  /** The reading taken immediately after it, or null if that read failed. */
+  after: RunwaySnapshot | null;
 }
 
 export interface ApiError {

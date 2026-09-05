@@ -3,6 +3,7 @@
 import { explorerAddressUrl } from "@/lib/constants";
 import { formatAgo, formatCountdown, truncateMiddle } from "@/lib/format";
 import type { AgentMode, AgentStatus } from "@/lib/types";
+import { OperatorControls } from "./OperatorControls";
 
 /**
  * What the badge shows before `/api/snapshot` has resolved.
@@ -30,17 +31,24 @@ export interface StatusStripProps {
   lastTickAt: number | null;
   ticking: boolean;
   /**
-   * Whether this build offers a RUN TICK button.
+   * Whether this build offers the operator controls at all.
    *
-   * False on a deployment. `/api/tick` is the one endpoint that can spend, so
-   * there it requires the deployment's shared secret — and a button in a public
-   * page could only send that secret by carrying it, which would hand it to
-   * every visitor. Rather than ship a button that 401s, or a secret that is not
-   * secret, the deployed build states what actually drives the agent. An
-   * operator ticks with an authenticated request instead.
+   * True everywhere now. It used to be false on a deployment, on the grounds
+   * that a button could only send the tick secret by carrying it — but the page
+   * does not carry it: a human pastes it in. See `manualTickEnabled()` in
+   * `src/lib/deployment.ts` and `OperatorControls`.
    */
   manualTick?: boolean;
-  onTick: () => void;
+  /**
+   * Whether those controls must ask for the shared secret before they will do
+   * anything. Resolved on the SERVER (`operatorAuthRequired()`), because a page
+   * cannot be trusted to decide whether it needs to authenticate — and the
+   * check that actually matters runs in the route handler either way.
+   */
+  operatorAuthRequired?: boolean;
+  onTick: (secret: string) => void;
+  /** Runs the operator's withdrawal. Resolves to a line to show them. */
+  onSqueeze: (secret: string) => Promise<string>;
 }
 
 function Cell({
@@ -107,7 +115,9 @@ export function StatusStrip({
   lastTickAt,
   ticking,
   manualTick = true,
+  operatorAuthRequired = false,
   onTick,
+  onSqueeze,
 }: StatusStripProps) {
   const mode: StripMode = status?.mode ?? initialMode ?? "CONNECTING";
   const isMock = mode === "MOCK";
@@ -180,34 +190,28 @@ export function StatusStrip({
           </Cell>
         </div>
 
-        <div className="flex items-center border-l border-line px-3">
-          {manualTick ? (
-            <button
-              type="button"
-              onClick={onTick}
-              disabled={ticking}
-              className="border border-line-bright bg-panel-2 px-4 py-2 text-[12px] font-bold tracking-[0.2em] text-ink transition-colors hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              {ticking ? "RUNNING\u2026" : "RUN TICK NOW"}
-            </button>
-          ) : (
-            /* Not a disabled button: there is nothing here for a visitor to
-               press, and a greyed-out control invites them to try. It states
-               the fact instead \u2014 the cycle is scheduled, and nobody watching
-               this page is what causes the agent to act. */
+        {manualTick ? (
+          <OperatorControls
+            authRequired={operatorAuthRequired}
+            ticking={ticking}
+            onTick={onTick}
+            onSqueeze={onSqueeze}
+          />
+        ) : (
+          /* Not a disabled button: there is nothing here for a visitor to
+             press, and a greyed-out control invites them to try. It states
+             the fact instead \u2014 the cycle is scheduled, and nobody watching
+             this page is what causes the agent to act. */
+          <div className="flex items-center border-l border-line px-3">
             <span
               className="border border-dashed px-4 py-2 text-[12px] font-bold tracking-[0.2em]"
               style={{ borderColor: "var(--line-bright)", color: "var(--ink-faint)" }}
-              title={
-                "Scheduled deployment: the cycle is driven by a cron job calling /api/tick, " +
-                "which requires the deployment's shared secret. No manual tick is offered " +
-                "here because the page would have to carry that secret to send it."
-              }
+              title="Operator controls are disabled in this build."
             >
               CRON DRIVEN
             </span>
-          )}
-        </div>
+          </div>
+        )}
       </div>
 
       <div className="h-[3px] w-full bg-panel-3">

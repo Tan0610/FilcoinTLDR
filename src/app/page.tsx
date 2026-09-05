@@ -3,6 +3,7 @@ import { connection } from "next/server";
 import { Dashboard } from "@/components/Dashboard";
 import { getChainMode } from "@/lib/chain";
 import { dashboardPollMs, manualTickEnabled } from "@/lib/deployment";
+import { operatorAuthRequired } from "@/lib/tickAuth";
 
 /**
  * The mode badge must be right on the FIRST painted frame.
@@ -27,10 +28,13 @@ import { dashboardPollMs, manualTickEnabled } from "@/lib/deployment";
  * reason — the answer is in the environment, and it must be the SERVER's
  * answer:
  *
- *   - `manualTick`: whether to offer a RUN TICK button at all. On a public
- *     deployment `/api/tick` needs a shared secret, and the only way a browser
- *     button could send one is if the secret were in the page. It is not, so
- *     the button is not either. See `src/lib/deployment.ts`.
+ *   - `manualTick` / `operatorAuthRequired`: whether to offer the operator
+ *     controls, and whether they must demand the deployment's shared secret
+ *     first. Both are the SERVER's answer — a page cannot be trusted to decide
+ *     whether it needs to authenticate, and resolving it here means the input
+ *     is in the first painted frame rather than appearing after a fetch. The
+ *     secret itself is never rendered and never inlined: a human pastes it in.
+ *     See `src/lib/deployment.ts` and `src/components/OperatorControls.tsx`.
  *   - `pollMs`: whether the dashboard must poll. Locally the SSE stream comes
  *     from the very process running the agent and is authoritative. Under the
  *     cron driver it is not — the tick ran in a different Function instance —
@@ -42,6 +46,7 @@ export default async function Home() {
     <Dashboard
       initialMode={getChainMode() === "live" ? "LIVE" : "MOCK"}
       manualTick={manualTickEnabled()}
+      operatorAuthRequired={operatorAuthRequired()}
       pollMs={dashboardPollMs()}
     />
   );

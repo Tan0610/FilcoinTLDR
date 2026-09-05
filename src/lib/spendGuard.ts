@@ -48,6 +48,7 @@
  * may respond fully to a genuine emergency and then must stop for the day.
  */
 
+import { isDepositAction } from "./policy";
 import type { AgentMode, Decision } from "./types";
 import { addDecimal, groupDigits, parseUnits, toFixedString } from "./units";
 
@@ -235,12 +236,15 @@ export function describeLimits(limits: SpendLimits): string {
  *
  * A deposit counts once it has EXECUTED, and for the amount the rule asked for
  * — the same definition `accumulate()` totals in `journal.ts`, so the cap and
- * the AUTONOMOUS DEPOSITS tile can never disagree about what was spent.
+ * the AUTONOMOUS DEPOSITS tile can never disagree about what was spent. Both
+ * gate on `isDepositAction`, which is what keeps an executed `PRUNE_DATASET`
+ * (which carries a top-up rule but deposits nothing) out of both figures.
  */
 export function spendEntriesFrom(decisions: readonly Decision[]): SpendEntry[] {
   const entries: SpendEntry[] = [];
   for (const decision of decisions) {
     if (decision.outcome !== "EXECUTED") continue;
+    if (!isDepositAction(decision.action)) continue;
     const amount = decision.ruleFired?.topUpAmount;
     if (!amount || parseUnits(amount) <= 0n) continue;
     entries.push({ id: decision.id, at: decision.at, amountUsdfc: amount });

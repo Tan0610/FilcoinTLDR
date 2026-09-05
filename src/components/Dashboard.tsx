@@ -25,6 +25,8 @@ import {
 import type {
   AgentEvent,
   AgentMode,
+  ApiError,
+  SqueezeResponse,
   AgentNotice,
   AgentStatus,
   Decision,
@@ -65,12 +67,17 @@ export interface DashboardProps {
    */
   initialMode?: AgentMode;
   /**
-   * Whether this build offers a RUN TICK button. False on a deployment, where
-   * `/api/tick` requires a secret the browser must never be given. Resolved on
-   * the server so the button is absent from the first painted frame rather
-   * than appearing and then being taken away.
+   * Whether this build offers the operator controls. Resolved on the server so
+   * they are present (or absent) in the first painted frame rather than
+   * appearing a moment later.
    */
   manualTick?: boolean;
+  /**
+   * Whether those controls must ask for the deployment's shared secret before
+   * they will do anything. The secret itself is never in this bundle — a human
+   * pastes it into the page. See `OperatorControls`.
+   */
+  operatorAuthRequired?: boolean;
   /**
    * How often to re-read `/api/snapshot` and `/api/decisions`, in ms. 0 (the
    * local default) means never: the SSE stream is served by the same process
@@ -84,7 +91,12 @@ export interface DashboardProps {
   pollMs?: number;
 }
 
-export function Dashboard({ initialMode, manualTick = true, pollMs = 0 }: DashboardProps = {}) {
+export function Dashboard({
+  initialMode,
+  manualTick = true,
+  operatorAuthRequired = false,
+  pollMs = 0,
+}: DashboardProps = {}) {
   const [snapshot, setSnapshot] = useState<RunwaySnapshot | null>(null);
   const [status, setStatus] = useState<AgentStatus | null>(null);
   /**
@@ -276,14 +288,70 @@ export function Dashboard({ initialMode, manualTick = true, pollMs = 0 }: Dashbo
     return () => window.clearInterval(timer);
   }, []);
 
-  const onTick = useCallback(async () => {
-    setTicking(true);
-    try {
-      await fetch("/api/tick", { method: "POST" });
-    } finally {
-      setTicking(false);
-    }
+  /**
+   * The operator's secret travels as a REQUEST HEADER and never anywhere else.
+   *
+   * `x-filrunway-tick-secret` rather than `Authorization` because the latter is
+   * the header proxies are most likely to rewrite, and `tickAuth` accepts both.
+   * It is omitted entirely when empty, so the local (open) case sends exactly
+   * the request it always did.
+   */
+  const authHeaders = useCallback((secret: string): HeadersInit => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (secret) headers["x-filrunway-tick-secret"] = secret;
+    return headers;
   }, []);
+
+  const onTick = useCallback(
+    async (secret: string) => {
+      setTicking(true);
+      try {
+        await fetch("/api/tick", { method: "POST", headers: authHeaders(secret) });
+      } finally {
+        setTicking(false);
+      }
+    },
+    [authHeaders],
+  );
+
+  /**
+   * The operator's forced-decision control.
+   *
+   * Returns a line for the strip to show rather than throwing, because every
+   * outcome here is information the operator needs: a 401 means the secret is
+   * wrong, a 400 means the bound refused the amount, and a success needs the
+   * before/after runway so it is obvious the drop was real. Nothing about this
+   * touches the decision feed — a withdrawal is not a decision.
+   */
+  const onSqueeze = useCallback(
+    async (secret: string): Promise<string> => {
+      try {
+        const response = await fetch("/api/squeeze", {
+          method: "POST",
+          headers: authHeaders(secret),
+          body: JSON.stringify({}),
+        });
+        const body = (await response.json()) as SqueezeResponse | ApiError;
+        if (!response.ok || "error" in body) {
+          return "error" in body ? body.error : `Squeeze refused (HTTP ${response.status}).`;
+        }
+        // Fold the post-withdrawal reading straight in so the gauge drops
+        // without waiting for the next 2s sense.
+        applySnapshot(body.after ?? body.before);
+        const after = body.after
+          ? `${body.after.daysRemaining.toFixed(2)}d`
+          : "unread";
+        return (
+          `OPERATOR withdrew ${body.amountUsdfc} USDFC from Filecoin Pay. Runway ` +
+          `${body.before.daysRemaining.toFixed(2)}d → ${after}. The agent decides what to ` +
+          "do about it on its next tick."
+        );
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+    },
+    [applySnapshot, authHeaders],
+  );
 
   const band = runwayBand(displayDays);
   const burnPerEpoch = snapshot?.lockupRate ?? "0";
@@ -331,7 +399,9 @@ export function Dashboard({ initialMode, manualTick = true, pollMs = 0 }: Dashbo
         lastTickAt={lastTickAt}
         ticking={ticking}
         manualTick={manualTick}
-        onTick={() => void onTick()}
+        operatorAuthRequired={operatorAuthRequired}
+        onTick={(secret) => void onTick(secret)}
+        onSqueeze={onSqueeze}
       />
 
       <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-[minmax(380px,0.85fr)_1.15fr]">

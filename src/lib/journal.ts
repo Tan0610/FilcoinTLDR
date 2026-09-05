@@ -76,6 +76,7 @@
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
+import { isDepositAction } from "./policy";
 import type { AgentMode, Decision, DecisionTotals } from "./types";
 import { addDecimal } from "./units";
 
@@ -241,13 +242,21 @@ export function emptyTotals(): DecisionTotals {
  * the same definition the dashboard tile already used when it derived this from
  * the current tab's state, so moving it server-side changes the SCOPE of the
  * figure and nothing else about how it is computed.
+ *
+ * `isDepositAction` guards the SUM. A `PRUNE_DATASET` decision also carries the
+ * top-up rule it was taken instead of — which is exactly what makes the record
+ * legible — and it also executes a transaction. Without that guard an eviction
+ * would add its deferred 5 USDFC to a tile labelled AUTONOMOUS DEPOSITS having
+ * deposited nothing at all. It still counts towards `executed`: a transaction
+ * WAS made, and that count is about actions taken, not money moved.
  */
 export function accumulate(totals: DecisionTotals, decision: Decision): DecisionTotals {
   const executed = decision.outcome === "EXECUTED";
+  const deposited = executed && isDepositAction(decision.action);
   return {
     decisions: totals.decisions + 1,
     executed: totals.executed + (executed ? 1 : 0),
-    depositedUsdfc: executed
+    depositedUsdfc: deposited
       ? addDecimal(totals.depositedUsdfc, decision.ruleFired?.topUpAmount ?? "0")
       : totals.depositedUsdfc,
     firstAt: totals.firstAt === null ? decision.at : Math.min(totals.firstAt, decision.at),

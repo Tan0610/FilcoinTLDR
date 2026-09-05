@@ -70,6 +70,35 @@ export interface ChainAdapter {
    * real SUBMITTED -> CONFIRMED / FAILED progression.
    */
   waitForTransaction?(txHash: string): Promise<{ status: TxStatus; error?: string }>;
+
+  /**
+   * OPTIONAL, and DESTRUCTIVE. Terminate the Warm Storage payment rail for one
+   * data set: the service winds down over the lockup period, the provider stops
+   * being paid to hold the pieces, and there is no undo.
+   *
+   * Resolves once the transaction is submitted and its hash is known, exactly
+   * like `deposit()`, so the same SUBMITTED -> CONFIRMED progression applies.
+   *
+   * An adapter is allowed not to implement this. The agent then records its
+   * `PRUNE_DATASET` decision with an outcome saying the capability is absent —
+   * it never silently converts the decision into something else. And even where
+   * it IS implemented, `agent.ts` refuses to call it unless the deployment's
+   * explicit opt-in is set; see `src/lib/eviction.ts`.
+   */
+  terminateDataSet?(dataSetId: string): Promise<{ txHash: string }>;
+
+  /**
+   * OPTIONAL. Move `amountUsdfc` OUT of Filecoin Pay and back to the agent's
+   * own wallet.
+   *
+   * This is not something the agent ever does. It exists for the operator's
+   * SQUEEZE RUNWAY control, which manufactures a genuine funding crisis so the
+   * policy engine has something real to react to on a demo account whose true
+   * runway is measured in years. The funds move between two accounts the
+   * operator already controls; nothing is lost and nothing is simulated.
+   * See `src/lib/squeeze.ts`.
+   */
+  withdraw?(amountUsdfc: string): Promise<{ txHash: string }>;
 }
 
 export type ChainMode = "mock" | "live";

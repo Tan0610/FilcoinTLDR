@@ -83,11 +83,18 @@ describe("tickIntervalMs", () => {
 });
 
 describe("manualTickEnabled", () => {
-  it("offers the RUN TICK button locally and never on a deployment", () => {
-    // A button on a public page could only send the tick secret by carrying it,
-    // which would publish it to every visitor.
+  it("offers the operator controls on a deployment as well as locally", () => {
+    // This used to be false on Vercel, because a button could only send the
+    // tick secret by carrying it — which would publish it to every visitor of
+    // a public URL holding a funded wallet key.
+    //
+    // The page does not carry it. A human pastes the secret in and it is sent
+    // as a request header; nothing is inlined into the bundle or rendered into
+    // the HTML, and a visitor without it gets the 401 `/api/tick` already
+    // returns. What the old arrangement cost was the ability to demonstrate the
+    // agent at all on the deployment — a judge could only wait out the cron.
     expect(manualTickEnabled({})).toBe(true);
-    expect(manualTickEnabled({ VERCEL: "1" })).toBe(false);
+    expect(manualTickEnabled({ VERCEL: "1" })).toBe(true);
   });
 });
 

@@ -3,7 +3,12 @@
 import { useEffect, useState } from "react";
 
 import { formatBytes, truncateMiddle } from "@/lib/format";
-import type { ApiError, StorageListing, StorageResponse } from "@/lib/types";
+import type {
+  ApiError,
+  DataSetProofState,
+  StorageListing,
+  StorageResponse,
+} from "@/lib/types";
 import { SCROLL_FADE_STYLE, useScrollFade } from "@/lib/useScrollFade";
 
 /**
@@ -28,6 +33,70 @@ type State =
   | { kind: "ready"; listing: StorageListing }
   | { kind: "error"; message: string };
 
+/**
+ * The proof chip, and the three states it must keep apart.
+ *
+ * PROVING / OVERDUE / PROOF? are deliberately three values, not two. Collapsing
+ * an unreadable proof state into "overdue" is the exact mistake the agent is
+ * built not to make — it is what would have it terminate healthy storage on an
+ * RPC wobble — so the panel a judge checks the agent's reasoning against has to
+ * show the same three-way distinction the policy engine acts on.
+ */
+function ProofChip({ proof }: { proof: DataSetProofState }) {
+  if (!proof.readable) {
+    return (
+      <span
+        className="shrink-0 text-[10px]"
+        style={{ color: "var(--ink-faint)" }}
+        title={`Proof state unknown: ${proof.unknownReason ?? "read failed"}. Treated as unknown, never as a missed proof.`}
+      >
+        PROOF?
+      </span>
+    );
+  }
+
+  if (proof.isDelinquent) {
+    return (
+      <span
+        className="shrink-0 text-[10px] font-bold"
+        style={{ color: "var(--crit)" }}
+        title={
+          `Past its proving deadline (epoch ${proof.provingDeadline}) by ` +
+          `${proof.epochsOverdue?.toLocaleString("en-US") ?? "?"} epochs with no proof this ` +
+          "period. This data set is being paid for and is not earning its cost."
+        }
+      >
+        OVERDUE
+      </span>
+    );
+  }
+
+  if (proof.isLive !== true) {
+    return (
+      <span
+        className="shrink-0 text-[10px]"
+        style={{ color: "var(--ink-faint)" }}
+        title="Not live in PDPVerifier — terminated or never activated."
+      >
+        NOT LIVE
+      </span>
+    );
+  }
+
+  return (
+    <span
+      className="shrink-0 text-[10px]"
+      style={{ color: "var(--ok)" }}
+      title={
+        `Proven this period. Last proven at epoch ${proof.lastProvenEpoch ?? "unread"}; ` +
+        `proving deadline epoch ${proof.provingDeadline ?? "unread"}.`
+      }
+    >
+      PROVING
+    </span>
+  );
+}
+
 function Row({
   dataSetId,
   provider,
@@ -36,6 +105,7 @@ function Row({
   pieceCount,
   isLive,
   withCDN,
+  proof,
 }: {
   dataSetId: string;
   provider: string;
@@ -44,6 +114,7 @@ function Row({
   pieceCount: number;
   isLive: boolean;
   withCDN: boolean;
+  proof: DataSetProofState;
 }) {
   return (
     <li className="flex shrink-0 flex-wrap items-baseline gap-x-3 gap-y-0.5 border-b border-line/60 px-4 py-1.5 last:border-b-0 text-[11px]">
@@ -60,6 +131,7 @@ function Row({
         SP {truncateMiddle(provider, 6, 4)}
       </span>
       <span className="tnum shrink-0 text-ink-dim">{size}</span>
+      <ProofChip proof={proof} />
       {withCDN && <span className="shrink-0 text-[10px] text-accent">CDN</span>}
       {pieceCid ? (
         <span className="min-w-0 flex-1 truncate text-right text-accent" title={pieceCid}>
@@ -166,6 +238,7 @@ export function StoragePanel() {
                 pieceCount={set.pieceCids.length}
                 isLive={set.isLive}
                 withCDN={set.withCDN}
+                proof={set.proof}
               />
             ))}
           </ul>

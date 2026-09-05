@@ -40,6 +40,22 @@ function snapshotWith(days: number, wallet = "250"): RunwaySnapshot {
   };
 }
 
+/**
+ * Let every already-scheduled microtask run.
+ *
+ * The coalescing tests need the tick under test to have reached a particular
+ * point — past its own decision, or still inside `sense()` — before a second
+ * caller arrives. That used to be two `await Promise.resolve()`, which is a
+ * count of the awaits the cycle happened to contain at the time: adding one
+ * more `await` anywhere in `executeTick` (the PDP proof read did exactly that)
+ * silently changed where the test's second caller landed. Draining the queue
+ * expresses the actual requirement and cannot rot the same way. Still no
+ * timers, so nothing here depends on wall-clock.
+ */
+async function drainMicrotasks(): Promise<void> {
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+}
+
 const EMPTY_STORAGE: StorageListing = {
   takenAt: 0,
   dataSets: [],
@@ -365,8 +381,7 @@ describe("runTick: tickInFlight guard", () => {
     const adapter = install({ snapshots: [snapshotWith(5)], senseGate: gate });
 
     const slow = runTick();
-    await Promise.resolve();
-    await Promise.resolve();
+    await drainMicrotasks();
 
     const during = await runTick();
 
@@ -398,8 +413,7 @@ describe("runTick: tickInFlight guard", () => {
     const adapter = install({ snapshots: [snapshotWith(5)], depositGate: gate });
 
     const slow = runTick();
-    await Promise.resolve();
-    await Promise.resolve();
+    await drainMicrotasks();
 
     const during = await runTick();
 
@@ -426,8 +440,7 @@ describe("runTick: tickInFlight guard", () => {
     const adapter = install({ snapshots: [snapshotWith(5)], depositGate: gate });
 
     const first = runTick();
-    await Promise.resolve();
-    await Promise.resolve();
+    await drainMicrotasks();
     const second = runTick();
 
     release();

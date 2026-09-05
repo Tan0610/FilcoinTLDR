@@ -23,7 +23,10 @@ import { getChainAdapter } from "./chain";
 import { SENSE_INTERVAL_MS, TICK_INTERVAL_MS, explorerMessageUrl } from "./constants";
 import { DEMO_LABEL, DEMO_SCALED, DEMO_SCALE_AGREEMENT, scaleRules } from "./demo";
 import { agentDriver, tickIntervalMs } from "./deployment";
+import { describeEvictionGate, evictionDisabledNote, evictionEnabled } from "./eviction";
 import { DEFAULT_RULES, evaluate, newDecisionId } from "./policy";
+import { proofSnapshotFrom, unreadableProofSnapshot } from "./proof";
+import { planSqueeze, squeezeLimits } from "./squeeze";
 import {
   checkSpend,
   describeLimits,
@@ -36,7 +39,9 @@ import type {
   AgentStatus,
   Decision,
   LogLevel,
+  ProofSnapshot,
   RunwaySnapshot,
+  SqueezeResponse,
   StorageListing,
 } from "./types";
 import { toFixedString } from "./units";
@@ -101,6 +106,62 @@ function applySpendCap(decision: Decision): Decision {
   };
 }
 
+/**
+ * The SECOND gate on a destructive decision.
+ *
+ * `evaluate()` is already told whether eviction is armed and already refuses to
+ * mark a prune PENDING when it is not. This checks the environment AGAIN, right
+ * before the transaction, and it is deliberately redundant: the policy engine
+ * is pure and takes the answer as an argument, so a caller that passed the
+ * wrong argument — a test helper, a future refactor, a rule set loaded from
+ * somewhere else — could otherwise produce an executable prune from a
+ * deployment that never opted in. Terminating a data set is the one action in
+ * this system with no undo, so it is worth checking twice.
+ *
+ * It also handles the third refusal: an adapter with no termination call at
+ * all. In every case the decision KEEPS its action, its target and its
+ * reasoning and only its outcome changes, so the journal holds one record
+ * saying exactly what the agent concluded and exactly why nothing happened.
+ */
+function applyEvictionGate(decision: Decision): Decision {
+  if (decision.action !== "PRUNE_DATASET") return decision;
+
+  const target = decision.target;
+  if (!target) {
+    // Cannot happen from `evaluate()`, and must not be executed if it ever does.
+    return {
+      ...decision,
+      outcome: "NO_ACTION",
+      reasoning:
+        `${decision.reasoning} No target data set was recorded on this decision, so there ` +
+        "is nothing that could safely be terminated. Nothing was submitted.",
+    };
+  }
+
+  if (!evictionEnabled()) {
+    return {
+      ...decision,
+      outcome: "NO_ACTION",
+      target: { ...target, executionEnabled: false },
+      reasoning: `${decision.reasoning} ${evictionDisabledNote(target.dataSetId)}`,
+    };
+  }
+
+  const adapter = getChainAdapter();
+  if (typeof adapter.terminateDataSet !== "function") {
+    return {
+      ...decision,
+      outcome: "NO_ACTION",
+      target: { ...target, executionEnabled: false },
+      reasoning:
+        `${decision.reasoning} The ${adapter.mode} chain adapter exposes no termination ` +
+        "call, so this decision is recorded and not executed. No transaction was attempted.",
+    };
+  }
+
+  return decision;
+}
+
 /** Stand-in reading for a FAILED decision taken before any successful read. */
 function unknownSnapshot(): RunwaySnapshot {
   return {
@@ -136,6 +197,38 @@ export async function getStorage(): Promise<StorageListing> {
   const listing = await getChainAdapter().listStorage();
   storageCache = { at: now, listing };
   return listing;
+}
+
+/**
+ * Drop the cached listing. Called after a termination, because the cut data set
+ * must not keep appearing as live for another ten seconds — least of all to the
+ * next tick, which would then re-decide to cut a rail it has already cut.
+ */
+export function invalidateStorageCache(): void {
+  storageCache = null;
+}
+
+/**
+ * The PDP proof state the policy engine decides on.
+ *
+ * Built from the SAME storage listing the STORED DATA panel renders, so the
+ * panel and the decision beside it can never disagree about whether a data set
+ * is proving. `epoch` is the chain height from the reading that is about to be
+ * judged, never a local clock.
+ *
+ * NEVER THROWS. A failed listing produces a proof snapshot that says the
+ * listing failed and asserts nothing about any data set — which
+ * `classifyProofState` and `describeProof` both treat as UNKNOWN. That is the
+ * single most important property in this file: an RPC hiccup must degrade the
+ * agent to "I could not look", never to "nothing is proving".
+ */
+async function readProof(epoch: number): Promise<ProofSnapshot> {
+  try {
+    const listing = await getStorage();
+    return proofSnapshotFrom(listing.dataSets, epoch);
+  } catch (error) {
+    return unreadableProofSnapshot(epoch, errorMessage(error));
+  }
 }
 
 export async function getStatus(): Promise<AgentStatus> {
@@ -311,8 +404,23 @@ async function executeTick(): Promise<Decision> {
     return failed;
   }
 
-  let decision = evaluate(snapshot, ACTIVE_RULES);
+  // Enrich the reading with PDP proof state before deciding on it. Done here
+  // rather than in `sense()` because `sense()` runs every two seconds to drive
+  // the gauge and this is several contract reads deep; the tick is the only
+  // place the answer is actually used. `readProof` never throws — an
+  // unreadable listing becomes a stated unknown, never a delinquency.
+  const proof = await readProof(snapshot.epoch);
+  snapshot = { ...snapshot, proof };
+  store.setSnapshot(snapshot);
+
+  let decision = evaluate(snapshot, ACTIVE_RULES, {
+    // The policy engine stays pure: it is TOLD whether eviction is armed here
+    // rather than reading the environment itself. `applyEvictionGate` below
+    // asks the environment a second time before anything is submitted.
+    evictionEnabled: evictionEnabled(),
+  });
   decision = applySpendCap(decision);
+  decision = applyEvictionGate(decision);
 
   store.upsertDecision(decision);
   store.markTick(decision.at);
@@ -340,6 +448,10 @@ async function executeTick(): Promise<Decision> {
         "wallet to let the policy act.",
     );
     return decision;
+  }
+
+  if (decision.action === "PRUNE_DATASET") {
+    return executePrune(decision);
   }
 
   if (decision.action === "HOLD" || !decision.ruleFired) {
@@ -430,6 +542,194 @@ async function executeTick(): Promise<Decision> {
 }
 
 /**
+ * Carry out a `PRUNE_DATASET` decision.
+ *
+ * Only ever reached with a decision that has already been through
+ * `applyEvictionGate`, so by the time anything is submitted the deployment has
+ * said yes twice and the adapter is known to implement the call.
+ *
+ * A withheld prune is NOT a failure and is not dressed as one: the decision was
+ * made, it is journalled with its target and its reasoning, and the trace says
+ * why nothing was submitted. That record is the autonomy artifact; the
+ * transaction is only its consequence.
+ */
+async function executePrune(decision: Decision): Promise<Decision> {
+  const store = getStore();
+  const target = decision.target;
+
+  if (decision.outcome === "NO_ACTION" || !target) {
+    // Declined by the gate, not by the chain. Nothing was attempted.
+    log("warn", decision.reasoning);
+    return decision;
+  }
+
+  const adapter = getChainAdapter();
+  log(
+    "warn",
+    `Terminating data set #${target.dataSetId}: ${target.epochsOverdue.toLocaleString("en-US")} ` +
+      "epochs past its proving deadline with no proof filed. This is irreversible.",
+  );
+
+  let settled = decision;
+  try {
+    // Non-null: `applyEvictionGate` refuses the decision when this is absent.
+    const { txHash } = await adapter.terminateDataSet!(target.dataSetId);
+    settled = { ...decision, outcome: "EXECUTED", txHash };
+    log(
+      "info",
+      `terminateService submitted for data set #${target.dataSetId} (${txHash.slice(0, 12)}…).`,
+    );
+
+    if (typeof adapter.waitForTransaction === "function") {
+      const result = await adapter
+        .waitForTransaction(txHash)
+        .catch((error: unknown) => ({
+          status: "FAILED" as const,
+          error: errorMessage(error),
+        }));
+
+      if (result.status === "FAILED") {
+        const message = result.error ?? "Transaction failed to confirm";
+        settled = { ...settled, outcome: "FAILED", error: message };
+        log("error", `Termination of data set #${target.dataSetId} did not confirm: ${message}`);
+      } else {
+        log(
+          "info",
+          `Data set #${target.dataSetId} terminated onchain; its payment rail winds down ` +
+            "over the lockup period and stops accruing.",
+        );
+      }
+    }
+  } catch (error) {
+    const message = errorMessage(error);
+    settled = { ...decision, outcome: "FAILED", error: message };
+    log("error", `Termination of data set #${target.dataSetId} failed: ${message}`);
+  }
+
+  // The cached listing still shows the cut data set as live. Left alone, the
+  // next tick would read it, judge it delinquent again and decide to terminate
+  // a rail it has already terminated.
+  invalidateStorageCache();
+
+  store.upsertDecision(settled);
+  store.publish({
+    id: store.nextEventId(),
+    at: Date.now(),
+    type: "decision",
+    decision: settled,
+  });
+
+  await sense().catch(() => log("warn", "Post-termination snapshot read failed."));
+  return settled;
+}
+
+/* ---------- the operator's squeeze ---------- */
+
+export type SqueezeOutcome =
+  | { ok: true; result: SqueezeResponse }
+  | { ok: false; status: 400 | 501 | 503; error: string };
+
+/**
+ * Withdraw USDFC from Filecoin Pay back to the agent's wallet, on an
+ * OPERATOR's instruction.
+ *
+ * This is the only function in this file that is not the agent acting, and it
+ * is kept visibly apart from everything that is:
+ *
+ *   - it produces NO `Decision` and touches no rule, so nothing it does can
+ *     land in the decision log or the deposits tile;
+ *   - it publishes its trace lines prefixed OPERATOR ACTION, and pins a
+ *     standing disclosure the moment it is first used, so a viewer arriving
+ *     later can still tell that the crisis on screen was manufactured;
+ *   - it waits for confirmation before returning, because an unconfirmed
+ *     withdrawal leaves the runway unchanged and a demo would read as broken.
+ *
+ * The agent's response on the following tick is the autonomous part. That
+ * distinction is the whole reason this is a separate, human-authenticated
+ * endpoint rather than another branch of the policy engine.
+ */
+export async function squeezeRunway(requested?: string | null): Promise<SqueezeOutcome> {
+  const adapter = getChainAdapter();
+  if (typeof adapter.withdraw !== "function") {
+    return {
+      ok: false,
+      status: 501,
+      error: `The ${adapter.mode} chain adapter cannot withdraw from Filecoin Pay.`,
+    };
+  }
+
+  let before: RunwaySnapshot;
+  try {
+    // A FRESH reading, not the cached one: the bound is checked against the
+    // unlocked balance as it is now, and the "before" figure a demo compares
+    // against has to be the one the withdrawal actually ran from.
+    before = await sense();
+  } catch (error) {
+    return {
+      ok: false,
+      status: 503,
+      error:
+        "Refused: the account could not be read, so no withdrawal can be shown to be safe " +
+        `(${errorMessage(error)}). Nothing was submitted.`,
+    };
+  }
+
+  const plan = planSqueeze(requested, before.fundsAvailable, squeezeLimits());
+  if (!plan.ok) return { ok: false, status: 400, error: plan.reason };
+
+  log("warn", `OPERATOR ACTION: ${plan.note}`);
+  // Pinned, because it outlives the trace and it is the answer to "did the
+  // agent cause this?". Idempotent by key: a second squeeze restates nothing.
+  notice(
+    "operator-squeeze",
+    "warn",
+    "An OPERATOR has withdrawn USDFC from Filecoin Pay to the agent wallet in this session, " +
+      "deliberately shortening the runway so the policy engine has a real crisis to answer. " +
+      "The withdrawal is a human action; the decisions that follow it are the agent's.",
+  );
+
+  let txHash: string;
+  try {
+    ({ txHash } = await adapter.withdraw(plan.amountUsdfc));
+  } catch (error) {
+    const message = errorMessage(error);
+    log("error", `OPERATOR ACTION failed: withdrawal of ${plan.amountUsdfc} USDFC — ${message}`);
+    return { ok: false, status: 503, error: message };
+  }
+
+  const explorerUrl = explorerMessageUrl(txHash);
+  log(
+    "warn",
+    `OPERATOR ACTION: withdrawal of ${plan.amountUsdfc} USDFC submitted (${txHash.slice(0, 12)}…).`,
+  );
+
+  if (typeof adapter.waitForTransaction === "function") {
+    const result = await adapter
+      .waitForTransaction(txHash)
+      .catch((error: unknown) => ({ status: "FAILED" as const, error: errorMessage(error) }));
+    if (result.status === "FAILED") {
+      const message = result.error ?? "Withdrawal failed to confirm";
+      log("error", `OPERATOR ACTION did not confirm: ${message}`);
+      return { ok: false, status: 503, error: message };
+    }
+  }
+
+  const after = await sense().catch(() => null);
+  log(
+    "warn",
+    `OPERATOR ACTION complete: ${plan.amountUsdfc} USDFC withdrawn. Runway is now ` +
+      `${after ? after.daysRemaining.toFixed(2) : "unread"} days ` +
+      `(was ${before.daysRemaining.toFixed(2)}). The agent decides what to do about it on ` +
+      "its next tick.",
+  );
+
+  return {
+    ok: true,
+    result: { amountUsdfc: plan.amountUsdfc, txHash, explorerUrl, before, after },
+  };
+}
+
+/**
  * Prepare this process to answer a request about the agent.
  *
  * Two things, in order, and every route calls it in place of
@@ -485,6 +785,13 @@ export function ensureAgentLoop(): void {
     // Raised only when the cap is actually in force — a MOCK run states nothing,
     // since claiming a limit that is not enforced would be worse than silence.
     notice("spend-cap", "info", describeLimits(spendLimits()));
+  }
+  if (evictionEnabled()) {
+    // Pinned, and raised ONLY when the capability is actually armed. A viewer
+    // has to be able to tell, at any point in the session, whether this agent
+    // is permitted to destroy data — and silence has to mean "no", which is
+    // why there is no corresponding notice for the disarmed case.
+    notice("eviction-armed", "warn", describeEvictionGate());
   }
   if (store.journal.enabled) {
     // Where the record lives is already permanent on screen: `journalPath` on

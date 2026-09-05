@@ -87,17 +87,39 @@ export function tickIntervalMs(local: number, env: DeploymentEnv = process.env):
 }
 
 /**
- * Whether the dashboard may offer an in-browser RUN TICK button.
+ * Whether the dashboard offers in-browser operator controls (RUN TICK NOW and
+ * SQUEEZE RUNWAY).
  *
- * Under the cron driver it may not. `/api/tick` requires a shared secret there
- * (see `tickAuth.ts`), and the only way a browser button could send that secret
- * is if the secret were in the page — which would publish it to everyone who
- * opens the public URL, on a deployment holding a funded wallet key. The button
- * is therefore absent from the deployed build, and an operator ticks with an
- * authenticated request instead. Locally nothing changes.
+ * ALWAYS, NOW — AND WHY THAT IS STILL SAFE
+ * ----------------------------------------
+ * This used to be `agentDriver(env) === "interval"`, i.e. locally only, on a
+ * sound argument: `/api/tick` requires a shared secret on a deployment, and a
+ * button could only send that secret by carrying it, which would publish it to
+ * every visitor of a public URL holding a funded wallet key.
+ *
+ * The premise was that the page would have to supply the secret. It does not.
+ * The controls render inert and a HUMAN pastes the secret into the page to arm
+ * them; it lives in that one tab's memory and is sent as a request header.
+ * Nothing is compiled into the client bundle, nothing is rendered into the
+ * HTML, and a visitor without the secret has a control that 401s — which is
+ * exactly the protection `/api/tick` already provides on its own.
+ *
+ * What that buys is the thing the old arrangement cost: a judge on the deployed
+ * dashboard can advance the loop instead of waiting out a 60-second cron, and
+ * can trigger the squeeze that gives the agent something to decide about. An
+ * agent whose autonomy cannot be observed inside a demo may as well not have
+ * any. See `src/components/OperatorControls.tsx` and `src/lib/squeeze.ts`.
+ *
+ * `operatorAuthRequired()` (in `tickAuth.ts`) is the companion answer: whether
+ * those controls must ask for a secret before they will do anything.
  */
 export function manualTickEnabled(env: DeploymentEnv = process.env): boolean {
-  return agentDriver(env) === "interval";
+  // The parameter is kept, unread, on purpose: every other predicate in this
+  // module is a function of the environment, and callers (and tests) pass one.
+  // Removing it would make this the odd one out at every call site for no gain,
+  // and it is the natural hook if a deployment ever needs to hide the controls.
+  void env;
+  return true;
 }
 
 /**
