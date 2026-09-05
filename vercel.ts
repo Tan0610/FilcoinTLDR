@@ -1,44 +1,58 @@
 /**
  * Vercel project configuration.
  *
- * `vercel.ts` rather than `vercel.json`: it is the current recommended form,
- * it type-checks against `@vercel/config`, and — the reason it matters here —
- * it can read the environment, so the cron schedule is a deployment setting
- * rather than a constant baked into a committed file. The Vercel CLI and the
- * platform build compile this to the JSON form automatically; there must not
- * also be a `vercel.json`.
+ * `vercel.ts` rather than `vercel.json`: it is the current recommended form and
+ * it type-checks against `@vercel/config`. The Vercel CLI compiles it to the
+ * JSON form automatically; there must not also be a `vercel.json`.
  *
  * WHAT THIS FILE IS FOR
  * ---------------------
  * The agent's cycle is a `setInterval` in `src/lib/agent.ts`. That works when a
  * single process stays alive and is meaningless on a Function that lives for
- * one request. Deployed, the driver is the cron job below: it calls
- * `/api/tick`, which is the same cycle the local timer runs, and which requires
- * `CRON_SECRET` before it will do anything (see `src/lib/tickAuth.ts`).
+ * one request. Deployed, the cycle has to be driven from outside: something
+ * calls `/api/tick`, which runs the same cycle the local timer runs, and which
+ * requires `CRON_SECRET` before it will do anything (see `src/lib/tickAuth.ts`).
+ *
+ * WHAT ACTUALLY DRIVES THE TICK
+ * -----------------------------
+ * `.github/workflows/agent-tick.yml`, every 5 minutes, sending
+ * `Authorization: Bearer $CRON_SECRET` to `POST /api/tick`. That is the real
+ * cadence. The cron job below is a once-a-day BACKSTOP only — this project is
+ * on the Hobby plan, where cron jobs run at most once a day (and may be up to
+ * an hour late), so a Hobby cron cannot be the driver of an agent that is
+ * supposed to look alive. Per-minute schedules need Pro.
  *
  * Vercel sends `Authorization: Bearer $CRON_SECRET` on every cron invocation
- * when that variable is set on the project, so the schedule below authenticates
+ * when that variable is set on the project, so the backstop authenticates
  * itself with no extra wiring — and an unauthenticated caller who finds the
  * path gets a 401 instead of a deposit.
  *
- * PLAN LIMITS — READ THIS BEFORE DEPLOYING
- * ----------------------------------------
- * Cron granularity is a plan feature. Hobby projects are limited to a small
- * number of cron jobs that run at most once a day, and the run may be up to an
- * hour late; per-minute schedules need Pro. A once-a-day agent is a poor demo,
- * so on Hobby either set FILRUNWAY_CRON_SCHEDULE to something the plan accepts
- * and drive the minute-by-minute cadence from an external scheduler calling
- * `/api/tick` with the same bearer token, or deploy to a Pro project.
+ * WHY THE SCHEDULE IS A LITERAL AND MUST STAY ONE
+ * -----------------------------------------------
+ * It used to read `process.env.FILRUNWAY_CRON_SCHEDULE?.trim() || DEFAULT`, on
+ * the assumption — stated in this comment, and wrong — that the platform
+ * compiles this file on the build machine where project environment variables
+ * are available. It does not. On a git-source deployment the platform reads
+ * this config STATICALLY, before any build runs: it cannot resolve a
+ * `process.env` expression, so it drops the key entirely and schema validation
+ * then fails with
  *
- * FILRUNWAY_CRON_SCHEDULE is read at BUILD time (this file is compiled on the
- * build machine, where project environment variables are available), so
- * changing it requires a redeploy — unlike the runtime variables, which do not.
+ *     `crons[0]` missing required property `schedule`
+ *
+ * — which is exactly what every git-push deploy of this project did until this
+ * value became a literal. Local `vercel deploy` was not affected, because there
+ * the CLI really does compile `vercel.ts` on this machine and upload finished
+ * JSON, which is what hid the bug.
+ *
+ * So: the schedule must be a value that survives static extraction. To change
+ * the backstop cadence, edit the line below and redeploy. Do not reintroduce a
+ * runtime expression here. (`deploymentEnv()` from `@vercel/config` is not an
+ * escape hatch either: it emits a `$NAME` placeholder for the routing layer to
+ * resolve at request time, which is not a cron expression and is not what the
+ * cron scheduler reads.)
  */
 
 import type { VercelConfig } from "@vercel/config/v1";
-
-/** Once a minute. The finest granularity Vercel Cron offers. */
-const DEFAULT_SCHEDULE = "* * * * *";
 
 export const config: VercelConfig = {
   framework: "nextjs",
@@ -46,7 +60,8 @@ export const config: VercelConfig = {
   crons: [
     {
       path: "/api/tick",
-      schedule: process.env.FILRUNWAY_CRON_SCHEDULE?.trim() || DEFAULT_SCHEDULE,
+      /** Daily backstop, 03:00 UTC. The Hobby plan permits no finer. */
+      schedule: "0 3 * * *",
     },
   ],
 

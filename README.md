@@ -13,7 +13,7 @@ Network: **Filecoin Calibration testnet**, chain ID `314159`. Nothing here touch
 
 An agent that stores data on Filecoin is easy. An agent that knows whether it can *afford* the data it is storing is not. Storage through Warm Storage is a continuous cost stream: a lockup rate per epoch, drawn against a balance held in Filecoin Pay. When that balance runs out the account goes into debt and the data stops being paid for.
 
-FilRunway closes that loop. Every 15 seconds locally — every 60 seconds on the Vercel deployment, where a cron job drives the cycle because a serverless Function has no process to hold a timer — it reads its own Filecoin Pay account, evaluates a policy against the runway it just read, and, with no human in the path, submits a real USDFC deposit when the runway is short. Every decision, including the decisions to do nothing, is written to a durable append-only audit log alongside the numbers it was based on — which is what makes "the agent authored this transaction" checkable rather than merely asserted. See [`npm run decisions`](#proving-the-agent-authored-the-transaction--npm-run-decisions).
+FilRunway closes that loop. Every 15 seconds locally — every 5 minutes on the Vercel deployment, where an external scheduler drives the cycle because a serverless Function has no process to hold a timer — it reads its own Filecoin Pay account, evaluates a policy against the runway it just read, and, with no human in the path, submits a real USDFC deposit when the runway is short. Every decision, including the decisions to do nothing, is written to a durable append-only audit log alongside the numbers it was based on — which is what makes "the agent authored this transaction" checkable rather than merely asserted. See [`npm run decisions`](#proving-the-agent-authored-the-transaction--npm-run-decisions).
 
 The interesting part is not the transaction. It is the moment the agent looks at `runwayInEpochs` and concludes it should act.
 
@@ -329,7 +329,7 @@ The cycle is the same everywhere. What **drives** it is chosen from the environm
 | Driver | Where | What starts the cycle | Interval |
 |---|---|---|---|
 | `interval` | `next dev`, `next start`, any long-lived process | `ensureAgentLoop()` (`src/lib/agent.ts:472`) sets two `setInterval` timers on the first API request, lazily, so nothing schedules work during `next build`. | sense 2s (`SENSE_INTERVAL_MS`), tick 15s (`TICK_INTERVAL_MS`) |
-| `cron` | Vercel | **Nothing in this process.** `ensureAgentLoop()` starts no timer and takes no tick; a Vercel Cron Job declared in `vercel.ts` issues `GET /api/tick` instead, authenticated with `CRON_SECRET`. | tick 60s (`CRON_TICK_INTERVAL_MS`, `src/lib/deployment.ts:49`) |
+| `cron` | Vercel | **Nothing in this process.** `ensureAgentLoop()` starts no timer and takes no tick; an external scheduler calls `/api/tick` instead, authenticated with `CRON_SECRET` — here, [`.github/workflows/agent-tick.yml`](.github/workflows/agent-tick.yml) every 5 minutes, with the daily Vercel Cron Job in `vercel.ts` as a backstop. | tick 60s default (`CRON_TICK_INTERVAL_MS`, `src/lib/deployment.ts:49`), overridden to 300s by `FILRUNWAY_CRON_INTERVAL_MS` |
 
 That second row is the whole point of the split, and the reason it is a hard branch rather than a fallback. A Function exists for the length of one request, so a timer set inside it either never fires or fires on an instance nobody is looking at — and the *immediate* first tick the local loop performs would mean that merely **reading the dashboard** could cause the agent to spend. Under the cron driver no route may start a cycle as a side effect of being read.
 
@@ -571,7 +571,7 @@ NEXT_PUBLIC_FILRUNWAY_DEMO_SCALE=480
 # FILRUNWAY_DECISION_LOG=
 ```
 
-`.env.example` carries the same guidance: both scale variables (defaulted to `1`, off), and `FILRUNWAY_DECISION_LOG` left commented out, with the per-mode default paths and the reason to leave it that way spelled out in the comment above it. It also documents every deployment variable — the driver, the cron schedule and its interval, the tick secret, the Blob journal and the spending cap — each commented out, with values never filled in, so the same eleven appear there and in the table in ["Deploying to Vercel"](#deploying-to-vercel). Nothing below this point in the setup is needed to run locally; see ["Deploying to Vercel"](#deploying-to-vercel) when you want it on the internet.
+`.env.example` carries the same guidance: both scale variables (defaulted to `1`, off), and `FILRUNWAY_DECISION_LOG` left commented out, with the per-mode default paths and the reason to leave it that way spelled out in the comment above it. It also documents every deployment variable — the driver, the dashboard tick interval, the tick secret, the Blob journal and the spending cap — each commented out, with values never filled in, so the same ten appear there and in the table in ["Deploying to Vercel"](#deploying-to-vercel). Nothing below this point in the setup is needed to run locally; see ["Deploying to Vercel"](#deploying-to-vercel) when you want it on the internet.
 
 ### 4. Smoke-test the chain before touching the UI
 
@@ -658,15 +658,15 @@ The local agent is a `setInterval` in a process that stays alive. A Vercel Funct
 >
 > Vercel Cron's schedule resolution depends on your plan. **Hobby projects are limited to a small number of cron jobs that run at most about once a day, and the run may be up to an hour late.** Per-minute schedules need **Pro**. A once-a-day agent is a poor demo and a badly misleading one, since the dashboard's NEXT TICK countdown would be describing a schedule nobody would sit through.
 >
-> On Hobby, do this instead — it is exactly as autonomous, and the code cannot tell the difference:
+> This project is on Hobby, so it does this instead — it is exactly as autonomous, and the code cannot tell the difference:
 >
-> 1. Set `FILRUNWAY_CRON_SCHEDULE` to something the plan accepts (for example `0 0 * * *`), so the deployment builds and the platform is satisfied.
-> 2. Drive the real cadence from an **external scheduler** — [cron-job.org](https://cron-job.org), a GitHub Actions `schedule:` workflow, or anything else that can issue an HTTP request — calling `GET https://<your-deployment>/api/tick` with the **same** `Authorization: Bearer $CRON_SECRET` header Vercel Cron would have sent.
-> 3. Optionally set `FILRUNWAY_CRON_INTERVAL_MS` to that external cadence, so the dashboard's NEXT TICK countdown describes the schedule actually in force rather than the 60s default.
+> 1. `vercel.ts` declares a daily cron (`0 3 * * *`) as a **backstop**, which is the finest the plan accepts, so the platform is satisfied.
+> 2. The real cadence comes from an **external scheduler**: [`.github/workflows/agent-tick.yml`](.github/workflows/agent-tick.yml), every 5 minutes, calling `POST https://filrunway.vercel.app/api/tick` with the **same** `Authorization: Bearer $CRON_SECRET` header Vercel Cron would have sent. (Add `CRON_SECRET` under the repository's **Settings → Secrets and variables → Actions** with the value the Vercel project holds. Any other scheduler — [cron-job.org](https://cron-job.org), anything that can issue an HTTP request — works identically.)
+> 3. `FILRUNWAY_CRON_INTERVAL_MS` is set to that external cadence (`300000`), so the dashboard's NEXT TICK countdown describes the schedule actually in force rather than the 60s default.
 >
 > Nothing about the agent changes: `/api/tick` is one handler behind one secret, and it does not know or care which scheduler called it.
 >
-> **`FILRUNWAY_CRON_SCHEDULE` is read at BUILD time.** `vercel.ts` is compiled on the build machine, where project environment variables are available, so changing that one variable requires a **redeploy**. Every other variable below is read at runtime and does not.
+> **The cron schedule is a hard-coded literal in `vercel.ts`, and has to be.** There is no `FILRUNWAY_CRON_SCHEDULE` variable any more. On a **git-source** deployment the platform reads the config file **statically**, before any build runs, so it cannot resolve a `process.env` expression: it drops the key and schema validation fails with ``crons[0]`` missing required property ``schedule``. A local `vercel deploy` hid that for a long time, because there the CLI genuinely does compile `vercel.ts` on your machine and upload finished JSON. Change the backstop cadence by editing the one line in `vercel.ts` and redeploying; change the real cadence by editing the `cron:` in the workflow.
 
 ### The steps, in order
 
@@ -702,14 +702,13 @@ Step 3 is the one people skip. `BLOB_READ_WRITE_TOKEN` is **injected by the plat
 
 ### Environment variables
 
-Everything in ["Setup from zero"](#setup-from-zero) still applies — `FILRUNWAY_MODE`, `FILECOIN_PRIVATE_KEY`, `FILECOIN_RPC_URL`, and both halves of the demo-scale pair. These are the eleven the deployment adds. **Values are never printed here or anywhere else in this repo.**
+Everything in ["Setup from zero"](#setup-from-zero) still applies — `FILRUNWAY_MODE`, `FILECOIN_PRIVATE_KEY`, `FILECOIN_RPC_URL`, and both halves of the demo-scale pair. These are the ten the deployment adds. **Values are never printed here or anywhere else in this repo.**
 
 | Variable | Set it? | What it does |
 |---|---|---|
 | `CRON_SECRET` | **Yes, before the first deploy** | The shared secret `/api/tick` requires, compared in constant time (`src/lib/tickAuth.ts:70`). Vercel's own name for it, so Vercel Cron sends `Authorization: Bearer $CRON_SECRET` on every scheduled invocation with no extra wiring. A deployment that requires the check and has no secret **refuses every tick with 503** rather than falling open. Generate with `openssl rand -hex 32`. |
 | `BLOB_READ_WRITE_TOKEN` | **Never by hand** | Injected when a Blob store is connected. Without it, a deployment's journal disables itself loudly and pins a warning, rather than silently writing to a `/tmp` that is about to be discarded. Works with a **public or a private** store; you do not have to know which you connected. |
-| `FILRUNWAY_CRON_SCHEDULE` | Only off Pro | The cron expression compiled into `vercel.ts`. Default `* * * * *`. **Read at build time — changing it needs a redeploy.** |
-| `FILRUNWAY_CRON_INTERVAL_MS` | Optional | What the dashboard should believe the tick cadence is, in ms. Default 60,000. Set it when an external scheduler, not Vercel Cron, is driving the real cadence, so NEXT TICK counts down to something real. |
+| `FILRUNWAY_CRON_INTERVAL_MS` | **Yes here** | What the dashboard should believe the tick cadence is, in ms. Default 60,000; set to `300000` on this deployment, matching the GitHub Actions workflow that actually drives the cycle, so NEXT TICK counts down to something real. |
 | `FILRUNWAY_AGENT_DRIVER` | Rarely | Forces `interval` or `cron`, overriding the `VERCEL=1` detection. Its purpose is a self-hosted long-running deployment that wants to keep the in-process timer. Anything other than those two literals is ignored rather than trusted — a typo must not silently disable the agent. |
 | `FILRUNWAY_REQUIRE_TICK_AUTH` | No (tests only) | Forces the tick secret check on (`1`/`true`) or off (`0`/`false`) regardless of driver. |
 | `FILRUNWAY_BLOB_PREFIX` | Optional | Where in the Blob store the journal lives. Default `filrunway/journal`. Useful to give two deployments separate records in one store. |
@@ -745,7 +744,7 @@ Any other rejection (a suspended store, a network fault) still disables the jour
 
 Run these in order. Each one fails loudly if the step before it was skipped.
 
-1. **The cron job is registered.** Vercel dashboard → your project → **Settings → Cron Jobs**. `/api/tick` must be listed with the schedule you expect. If the list is empty, `vercel.ts` did not compile into the build — check that there is no stray `vercel.json` competing with it.
+1. **The backstop cron job is registered.** Vercel dashboard → your project → **Settings → Cron Jobs**. `/api/tick` must be listed at `0 3 * * *`. If the list is empty, `vercel.ts` did not make it into the build — check that there is no stray `vercel.json` competing with it, and that nothing in `vercel.ts` is computed at runtime (a git-source deploy reads that file statically and rejects what it cannot resolve). The **real** cadence is the GitHub Actions run history for `agent-tick`, not this list.
 2. **The endpoint is closed.**
 
    ```bash
@@ -956,7 +955,7 @@ Ordered roughly by how much they would matter in production.
 | Chain client | viem 2.56 |
 | Transport | Server-Sent Events (`/api/stream`), carrying `snapshot`, `decision`, `tx`, `log`, `totals` and `notices` events. No websocket. Locally there is no client polling loop except the STORED DATA panel, which polls `/api/storage` every 30s; on the deployment the dashboard also re-reads `/api/snapshot` and `/api/decisions` every 5s, because the tick and the stream live in different Function instances. |
 | Persistence | Append-only JSON Lines, one stream per adapter mode. On disk locally (`src/lib/journal.ts`); as append-only segment objects in **Vercel Blob** (`@vercel/blob` 2.8, `src/lib/blobJournal.ts`) on Vercel, through the same parser. No database. |
-| Deployment | Vercel. Project config in `vercel.ts`, type-checked against **`@vercel/config`** 0.7 — `vercel.ts` rather than `vercel.json` because it can read the environment, so the cron schedule is a deployment setting rather than a constant baked into a committed file. Cycle driven by a Vercel Cron Job hitting `GET /api/tick`; `maxDuration` 300s on the tick and stream routes. |
+| Deployment | Vercel. Project config in `vercel.ts`, type-checked against **`@vercel/config`** 0.7. Every value in it is static: a git-source deploy reads that file without evaluating it, so a computed value is dropped and fails schema validation. Cycle driven by a GitHub Actions workflow hitting `POST /api/tick` every 5 minutes, with a daily Vercel Cron Job as backstop; `maxDuration` 300s on the tick and stream routes. |
 | Tests | Vitest 4, 332 tests across 17 files |
 | Network | Filecoin Calibration, chain ID 314159, 30s epochs, 2880 epochs/day |
 | Explorer | Filfox, `https://calibration.filfox.info/en/message/<hash>` |
@@ -998,7 +997,7 @@ A note on the SDK version, because most code samples online are stale: 1.2.1 rem
 | `src/app/api/*` | `snapshot`, `decisions`, `tick`, `stream`, `storage`. |
 | `src/app/api/stream/route.test.ts` | 9 tests driving the real route handler with a real `Request`, so the backlog window, the frame encoding and the connect order are under test rather than assumed. |
 | `src/app/api/tick/route.test.ts` | 9 tests on the one endpoint that can spend: 401 without the secret, 503 when none is configured, 200 for both verbs with it, and that authorisation happens before anything else can run. |
-| `vercel.ts` | Vercel project config: the cron schedule (env-driven, read at build time) and `maxDuration` on the tick and stream routes. Type-checked against `@vercel/config`. |
+| `vercel.ts` | Vercel project config: the daily backstop cron schedule (a static literal — a git-source deploy reads this file without evaluating it) and `maxDuration` on the tick and stream routes. Type-checked against `@vercel/config`. |
 | `src/components/*` | `RunwayGauge`, `StatTile`, `DecisionFeed`, `StoragePanel`, `StatusStrip`, `Dashboard`. |
 | `scripts/bootstrap.ts` | Operator CLI. The other file that sees the key. |
 | `scripts/decisions.ts` | Decision-log reader, plus `--split` and `--remote`. Needs no key and no server; `--remote` reads the deployed Blob journal instead of the local files. |
