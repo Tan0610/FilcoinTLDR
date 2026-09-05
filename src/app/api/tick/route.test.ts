@@ -22,7 +22,7 @@ import { emptyLoad, nullJournal, type DecisionJournal } from "@/lib/journal";
 import { resetStore } from "@/lib/store";
 import type { RunwaySnapshot, StorageListing, TickResponse } from "@/lib/types";
 
-const SECRET = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+const SECRET = "test-only-fixture-not-a-real-secret-do-not-use-in-production";
 
 /** Comfortably above every threshold, so a permitted tick HOLDs and spends nothing. */
 function healthySnapshot(): RunwaySnapshot {
