@@ -173,6 +173,35 @@ export interface DecisionJournal {
   load(scope?: JournalScope): JournalLoad;
   /** Append one record. Never throws. */
   append(decision: Decision): void;
+
+  /* ---------- remote journals only ---------- */
+
+  /**
+   * Whether `load()` alone is authoritative.
+   *
+   * True (or absent) for a journal backed by the local filesystem, which is
+   * every journal this project had before it was deployable: the store
+   * hydrates from it inside its own constructor and nothing has to wait.
+   *
+   * False for a journal whose records live somewhere that has to be fetched.
+   * The store then hydrates through `loadAsync()` instead, and callers wait on
+   * `AgentStore.ready` before trusting what they read.
+   */
+  readonly synchronous?: boolean;
+
+  /**
+   * Re-read the backing store. Never throws. Required when `synchronous` is
+   * false; a synchronous journal has no reason to implement it.
+   *
+   * Also the refresh path: on a serverless host the tick that wrote the last
+   * decision ran in a different process from the one now serving the
+   * dashboard, and this is how the second one finds out. See
+   * `AgentStore.refresh()`.
+   */
+  loadAsync?(scope?: JournalScope): Promise<JournalLoad>;
+
+  /** Wait for queued writes to reach the store. Never throws. */
+  flush?(): Promise<void>;
 }
 
 /** Zero mode counts. */
@@ -388,6 +417,8 @@ function errorMessage(error: unknown): string {
 class FileDecisionJournal implements DecisionJournal {
   readonly path: string;
   readonly mode: AgentMode;
+  /** The file is right here; `load()` is the whole story. */
+  readonly synchronous = true;
   private on = true;
   private error: string | null = null;
   private seq = 0;
@@ -461,6 +492,7 @@ export function nullJournal(mode: AgentMode = "MOCK"): DecisionJournal {
     mode,
     enabled: false,
     lastError: null,
+    synchronous: true,
     load: (scope: JournalScope = mode) => emptyLoad(scope),
     append: () => undefined,
   };

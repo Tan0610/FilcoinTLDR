@@ -13,7 +13,7 @@ Network: **Filecoin Calibration testnet**, chain ID `314159`. Nothing here touch
 
 An agent that stores data on Filecoin is easy. An agent that knows whether it can *afford* the data it is storing is not. Storage through Warm Storage is a continuous cost stream: a lockup rate per epoch, drawn against a balance held in Filecoin Pay. When that balance runs out the account goes into debt and the data stops being paid for.
 
-FilRunway closes that loop. Every 15 seconds it reads its own Filecoin Pay account, evaluates a policy against the runway it just read, and, with no human in the path, submits a real USDFC deposit when the runway is short. Every decision, including the decisions to do nothing, is written to a durable append-only audit log alongside the numbers it was based on — which is what makes "the agent authored this transaction" checkable rather than merely asserted. See [`npm run decisions`](#proving-the-agent-authored-the-transaction--npm-run-decisions).
+FilRunway closes that loop. Every 15 seconds locally — every 60 seconds on the Vercel deployment, where a cron job drives the cycle because a serverless Function has no process to hold a timer — it reads its own Filecoin Pay account, evaluates a policy against the runway it just read, and, with no human in the path, submits a real USDFC deposit when the runway is short. Every decision, including the decisions to do nothing, is written to a durable append-only audit log alongside the numbers it was based on — which is what makes "the agent authored this transaction" checkable rather than merely asserted. See [`npm run decisions`](#proving-the-agent-authored-the-transaction--npm-run-decisions).
 
 The interesting part is not the transaction. It is the moment the agent looks at `runwayInEpochs` and concludes it should act.
 
@@ -28,7 +28,7 @@ If you have one minute, read these five places in this order.
 | 1 | The runway is **read from the chain**, not derived | `src/lib/chain/synapse.ts` | `getSnapshot()` line 347 calls `synapse.payments.accountSummary()` — line 351 |
 | 2 | `runwayInEpochs` becomes the snapshot | `src/lib/chain/synapse.ts` | `toRunwaySnapshot()` line 129, `runwayEpochsToNumber()` line 100 |
 | 3 | **The decision itself.** Pure function, zero I/O | `src/lib/policy.ts` | `evaluate()` line 119; rule selection line 130; `selectRule()` line 92 |
-| 4 | The agent acts on it, unprompted — or declines when it cannot afford to | `src/lib/agent.ts` | `executeTick()` (the body behind `runTick()`): `evaluate(...)` line 228, `INSUFFICIENT_FUNDS` early return line 239, `adapter.deposit(...)` line 260 |
+| 4 | The agent acts on it, unprompted — or declines, in either of two ways | `src/lib/agent.ts` | `executeTick()` (the body behind `runTick()`): `evaluate(...)` line 314, `applySpendCap(...)` line 315 (defined at line 87), `SAFETY_CAP` early return line 326, `INSUFFICIENT_FUNDS` early return line 333, `adapter.deposit(...)` line 354 |
 | 5 | The deposit is a real onchain transaction | `src/lib/chain/synapse.ts` | `deposit()` line 375 calls `synapse.payments.fund({ amount })` — line 382 |
 
 The single load-bearing line is `src/lib/policy.ts:130`:
@@ -37,7 +37,12 @@ The single load-bearing line is `src/lib/policy.ts:130`:
 const rule = selectRule(days, rules);
 ```
 
-`days` came from `accountSummary().runwayInEpochs`. `rules` is the agent's policy. The transaction, the dashboard and the audit log are all downstream consequences of that one comparison — including the one case where there is no transaction: if the wallet cannot cover the deposit the fired rule wants, `evaluate()` returns `INSUFFICIENT_FUNDS` instead of the rule's action, and `runTick()` returns before ever calling `deposit()`.
+`days` came from `accountSummary().runwayInEpochs`. `rules` is the agent's policy. The transaction, the dashboard and the audit log are all downstream consequences of that one comparison — including the **two** cases where there is no transaction:
+
+- **`INSUFFICIENT_FUNDS`.** The wallet cannot cover the deposit the fired rule wants, so `evaluate()` returns that instead of the rule's action (`src/lib/policy.ts:162`) and `executeTick()` returns before ever calling `deposit()`.
+- **`SAFETY_CAP`.** The wallet *could* cover it, but the agent has already made as many deposits, or deposited as much, as its own rolling 24-hour limit allows. `applySpendCap()` (`src/lib/agent.ts:87`) rewrites the decision before it is journalled and `executeTick()` returns at line 326. See ["The agent's own spending cap"](#the-agents-own-spending-cap).
+
+Both carry `outcome: NO_ACTION`, both are recorded with full reasoning, and neither is a failed transaction: nothing was submitted.
 
 ### `runwayInEpochs` is a first-class onchain field
 
@@ -81,10 +86,13 @@ npm run decisions -- --limit 100   # show more than the default 20
 npm run decisions -- --executed    # only decisions that moved money
 npm run decisions -- --id <id>     # ONE decision in full: reading, rule, reasoning, outcome, tx hash
 npm run decisions -- --json        # raw {mode, decision} records, for jq
+npm run decisions -- --remote      # read the DEPLOYED agent's journal out of Vercel Blob
 npm run decisions -- --split       # move historical MOCK records out of the LIVE journal (dry run)
 ```
 
-`scripts/decisions.ts` needs **no private key, no RPC and no running server** — it only reads the file. The bare form ends with a `transactions the agent authored` block that pairs every tx hash with its Filfox URL, the id of the decision that authored it, and the exact command to expand that decision.
+`scripts/decisions.ts` needs **no private key and no running server**. In its default form it reads the local JSONL files and needs no network either. `--remote` points it at the deployed agent's Blob journal instead (`readBlobJournal()`, `src/lib/blobJournal.ts:447`) and needs only `BLOB_READ_WRITE_TOKEN`, which `vercel env pull .env.local` writes — still no private key, still no server. Every other flag behaves identically against either source, because both go through the same parser and the same mode scoping.
+
+The bare form ends with a `transactions the agent authored` block that pairs every tx hash with its Filfox URL, the id of the decision that authored it, and the exact command to expand that decision.
 
 To line the headline transaction in this README up against the decision that produced it:
 
@@ -128,27 +136,27 @@ The decision count keeps climbing (a fresh run will show more than 644, and a la
 
 Two caveats, stated up front:
 
-- **`data/` is gitignored.** A judge who clones this repo starts with an empty log. The record has to be shown from the machine that actually ran the agent — a terminal capture in the demo video, or the file itself. There is no way to ship it in the repo without also making it forgeable.
+- **`data/` is gitignored, and that no longer confines the evidence to one laptop.** A judge who clones this repo starts with an empty *local* log, and a record produced by a local run still has to be shown from the machine that produced it. The deployed agent, however, writes its journal to Vercel Blob, and `npm run decisions -- --remote` reads exactly those records — same parser, same mode scoping, same `--id`, `--executed` and `--json` views — from any machine holding the store's token. So "the evidence has to come from the operator's laptop" is true of a local run and **not** true of the deployment. Neither form is committed to the repo, because a journal that ships in git is a journal anyone can forge.
 - **Records are stamped `MOCK` or `LIVE` per line**, and that stamp is now acted on rather than merely written. See directly below.
 
 ### The journal is mode-scoped
 
 A MOCK decision is a real record of a real decision, but its transaction hash was invented by the mock adapter and is on no chain anywhere. Presenting the two streams in one total is the single misrepresentation this feature exists to prevent, so the mode stamp now drives three separate things.
 
-**1. Writes go to separate files by default.** With `FILRUNWAY_DECISION_LOG` unset, the path is derived from `FILRUNWAY_MODE` (`journalPathFor()`, `src/lib/journal.ts:488`):
+**1. Writes go to separate files by default.** With `FILRUNWAY_DECISION_LOG` unset, the path is derived from `FILRUNWAY_MODE` (`journalPathFor()`, `src/lib/journal.ts:520`):
 
 | `FILRUNWAY_MODE` | Journal file | |
 |---|---|---|
-| `live` | `data/decisions.jsonl` | The evidentiary record. **Unchanged**, so every existing reference to that path still resolves. |
+| `live` | `data/decisions.jsonl` | The evidentiary record. **Unchanged locally**, so every existing reference to that path still resolves on a developer machine. It does **not** resolve on the deployment: a Vercel Function's filesystem is read-only apart from an ephemeral `/tmp`, so the journal is written to Vercel Blob instead and `AgentStatus.journalPath` reports `blob:filrunway/journal/live/…`. See ["Deploying to Vercel"](#deploying-to-vercel). |
 | `mock` | `data/decisions.mock.jsonl` | Simulated spend, diverted here so it can never be appended into the file above. |
 
 Both are gitignored.
 
 **Leave `FILRUNWAY_DECISION_LOG` unset.** Setting it explicitly points *both* modes at that one file. That is still safe — every record is stamped and every read is scoped, so the dashboard and the CLI stay separated either way — but it re-mixes the two streams into one file, which is the state the per-mode default exists to avoid. Set it to `off` to disable persistence entirely and keep decisions in memory only.
 
-**2. Reads are scoped to the running mode.** `FileDecisionJournal.load()` (`src/lib/journal.ts:419`) defaults its scope to the journal's own mode, so a LIVE server replaying a file that also holds MOCK lines gets its own history back and nothing else. Crucially, a record whose `mode` field is missing or unrecognised reads as **MOCK** (`recordMode()`, `src/lib/journal.ts:270`): downgrading an unknown line is the only safe default, because a line must never be promoted into evidence by being unreadable. What the scope leaves out is counted (`byMode`) and disclosed rather than silently dropped.
+**2. Reads are scoped to the running mode.** `FileDecisionJournal.load()` (`src/lib/journal.ts:450`) defaults its scope to the journal's own mode, so a LIVE server replaying a file that also holds MOCK lines gets its own history back and nothing else. The Blob journal behaves identically: it concatenates its segments and hands the text to the same `parseJournal()` (`BlobDecisionJournal.load()`, `src/lib/blobJournal.ts:280`), so mode stamping, scoping, the `byMode` counts and the withheld-records disclosure are unchanged when the bytes move off disk. Crucially, a record whose `mode` field is missing or unrecognised reads as **MOCK** (`recordMode()`, `src/lib/journal.ts:299`): downgrading an unknown line is the only safe default, because a line must never be promoted into evidence by being unreadable. What the scope leaves out is counted (`byMode`) and disclosed rather than silently dropped.
 
-**3. The dashboard shows one mode and says which.** The AUTONOMOUS DEPOSITS tile and the decision feed are both fed from that scoped load, and `depositsTile()` (`src/lib/format.ts:192`) resolves the tile from the mode:
+**3. The dashboard shows one mode and says which.** The AUTONOMOUS DEPOSITS tile and the decision feed are both fed from that scoped load, and `depositsTile()` (`src/lib/format.ts:197`) resolves the tile from the mode:
 
 | Mode | Tile |
 |---|---|
@@ -158,7 +166,7 @@ Both are gitignored.
 
 MOCK is marked in three independent places — the first word of the label, the hazard-yellow accent, and the leading `MOCK ·` of the sub-line — so no crop of a screenshot can hide it. The figure itself is never altered: it is a true count of simulated activity, not a fake count of real activity.
 
-The AGENT TRACE says the same thing in words on startup (`AgentStore.hydrate()`, `src/lib/store.ts:116`). On the reference machine the restore line reads:
+The AGENT TRACE says the same thing in words on startup (`AgentStore.hydrate()`, `src/lib/store.ts:164`, or `hydrateAsync()` at line 173 for a journal whose records have to be fetched). On the reference machine the restore line reads:
 
 ```
 Restored 602 LIVE decisions from D:\Filecoin_TLDR\data\decisions.jsonl (1 executed,
@@ -170,16 +178,16 @@ That second sentence is the point. An omission a viewer cannot see is indistingu
 
 ### The disclosure outlives the trace line
 
-That restore line is an ordinary log event, and the trace it lands in is a rolling tail. Within minutes of boot it has scrolled away, and a judge opening the dashboard an hour later would have seen nothing. So the fact it carries is now held separately, as state. `discloseOmissions()` (`src/lib/store.ts:171`) raises it as an `AgentNotice` — a key, a level and a message, and nothing else (`src/lib/types.ts:137-142`):
+That restore line is an ordinary log event, and the trace it lands in is a rolling tail. Within minutes of boot it has scrolled away, and a judge opening the dashboard an hour later would have seen nothing. So the fact it carries is now held separately, as state. `discloseOmissions()` (`src/lib/store.ts:311`) raises it as an `AgentNotice` — a key, a level and a message, and nothing else (`src/lib/types.ts:145-150`):
 
 ```
 6 MOCK decisions in D:\Filecoin_TLDR\data\decisions.jsonl are withheld from this LIVE
 view. Read them with `npm run decisions -- --mode mock`.
 ```
 
-The same facts as the restore line, said again where they cannot expire. `addNotice()` (`src/lib/store.ts:207-221`) is idempotent by key and republishes the *whole* current set whenever it grows, and `/api/stream` sends that whole set on every connect *after* the backlog, so an older copy still sitting in the tail can never overwrite the authoritative one (`src/app/api/stream/route.ts`). The client replaces its copy rather than appending to it — `newerNotices()` (`src/lib/decisions.ts:104-110`) returns the existing array untouched when nothing is newer, so a reconnect restates the disclosure without re-rendering the row. It draws as a `PINNED` row above the rolling AGENT TRACE list, coloured by level (`src/components/Dashboard.tsx`).
+The same facts as the restore line, said again where they cannot expire. `addNotice()` (`src/lib/store.ts:347-351`) is idempotent by key and republishes the *whole* current set whenever it grows, and `/api/stream` sends that whole set on every connect *after* the backlog, so an older copy still sitting in the tail can never overwrite the authoritative one (`src/app/api/stream/route.ts`). The client replaces its copy rather than appending to it — `newerNotices()` (`src/lib/decisions.ts:104-110`) returns the existing array untouched when nothing is newer, so a reconnect restates the disclosure without re-rendering the row. It draws as a `PINNED` row above the rolling AGENT TRACE list, coloured by level (`src/components/Dashboard.tsx`).
 
-Five siblings ride the same channel: unreadable lines skipped, a journal that could not be read at all, a journal write that failed mid-session, persistence switched off entirely, and a `FILRUNWAY_DEMO_SCALE` that disagrees with its `NEXT_PUBLIC_` twin. Every one is raised behind an explicit conditional and the set starts empty, so a clean load in a single-mode journal pins nothing. **Nothing withheld means no notice at all**, which is the whole reason a pinned row is worth believing: it is only ever there because it is true. A viewer arriving hours after boot still sees what was withheld and the exact command that reads it.
+Six siblings ride the same channel: unreadable lines skipped, a journal that could not be read at all, a journal write that failed mid-session, persistence switched off entirely, a `FILRUNWAY_DEMO_SCALE` that disagrees with its `NEXT_PUBLIC_` twin, and — on a deployment — a `driver-cron` notice saying the cycle is driven by a scheduled call to `/api/tick` rather than by a timer in this process (`src/lib/agent.ts:532`), which is also the standing answer to "why is there no RUN TICK button?". A seventh, `spend-cap`, states the deposit limits in force, and is raised only when the cap actually applies (`src/lib/agent.ts:487`) — claiming a limit that is not being enforced would be worse than silence. Every one is raised behind an explicit conditional and the set starts empty, so a clean load in a single-mode journal pins nothing. **Nothing withheld means no notice at all**, which is the whole reason a pinned row is worth believing: it is only ever there because it is true. A viewer arriving hours after boot still sees what was withheld and the exact command that reads it.
 
 ### What `--mode` can and cannot widen
 
@@ -195,7 +203,7 @@ Both journal files are opened on every run whatever the mode, so the scope decid
 
 ### Un-mixing an already-mixed file: `--split`
 
-A journal written before the per-mode split holds both streams. That file is append-only evidence and must not be rewritten, so nothing is done to it automatically. `--split` is the explicit, opt-in way to copy the MOCK records out of the LIVE journal into the MOCK one (`split()`, `scripts/decisions.ts:210`):
+A journal written before the per-mode split holds both streams. That file is append-only evidence and must not be rewritten, so nothing is done to it automatically. `--split` is the explicit, opt-in way to copy the MOCK records out of the LIVE journal into the MOCK one (`split()`, `scripts/decisions.ts:217`). It is a local-file operation: a Blob journal has nothing to split, because its segment keys carry the mode (`filrunway/journal/<mode>/…`) and the two streams were never in one object to begin with.
 
 ```bash
 npm run decisions -- --split           # dry run: says what it would copy, writes nothing
@@ -251,28 +259,52 @@ Splitting is optional. Scoped reads already keep a mixed file honest; the split 
         +------------------------------v-------------------------------+
         |  src/lib/agent.ts     runTick():  sense -> decide -> act     |
         |        |                                                     |
-        |        +--> src/lib/policy.ts  evaluate()   PURE, 25 tests   |
+        |        +--> src/lib/policy.ts      evaluate()  PURE, 25 tests|
         |        |         snapshot + PolicyRule[]  ->  Decision       |
+        |        |                                                     |
+        |        +--> src/lib/spendGuard.ts  checkSpend() PURE, 20 t.  |
+        |        |         the agent's own rolling 24h deposit cap;    |
+        |        |         a refusal becomes a SAFETY_CAP decision     |
+        |        |                                                     |
+        |        +--> src/lib/deployment.ts  driver: interval | cron   |
+        |        |         read off VERCEL=1; decides whether a timer  |
+        |        |         starts at all, and the real tick interval   |
         |        |                                                     |
         |        +--> src/lib/store.ts   ring buffer + SSE pub/sub     |
         |                  |                                           |
-        |                  +--> src/lib/journal.ts  append-only JSONL  |
-        |                       durable; one file per mode;             |
-        |                       rehydrated on start, scoped to the mode |
+        |                  +--> src/lib/blobJournal.ts  selectJournal()|
+        |                       |                                      |
+        |                       +-- local   src/lib/journal.ts         |
+        |                       |           append-only JSONL on disk  |
+        |                       +-- Vercel  append-only JSONL segments |
+        |                                   in Vercel Blob             |
+        |                       one stream per mode; same parser, same |
+        |                       scoping; rehydrated + refreshed on read|
         +------------------------------+-------------------------------+
                                        |
         +------------------------------v-------------------------------+
-        |  /api/snapshot  /api/decisions  /api/tick  /api/stream       |
-        |  /api/storage                                                |
-        +------------------------------+-------------------------------+
-                                       | EventSource (SSE)
-        +------------------------------v-------------------------------+
-        |  Dashboard: RunwayGauge · StatTile · DecisionFeed ·          |
-        |             StoragePanel · StatusStrip                       |
-        +--------------------------------------------------------------+
+        |  /api/snapshot  /api/decisions  /api/stream  /api/storage    |
+        |  /api/tick   <- src/lib/tickAuth.ts: CRON_SECRET, constant   |
+        |                 time. The ONLY endpoint that can spend.      |
+        +---------^--------------------+-------------------------------+
+                  |                    | EventSource (SSE)
+   Vercel Cron ---+   +----------------v-------------------------------+
+   (vercel.ts)        |  Dashboard: RunwayGauge · StatTile ·           |
+   GET /api/tick      |             DecisionFeed · StoragePanel ·      |
+   every minute       |             StatusStrip                        |
+                      +------------------------------------------------+
 ```
 
 Nothing above `src/lib/chain/` imports the Synapse SDK or can see a private key. The whole product is written against `RunwaySnapshot` and `Decision` in `src/lib/types.ts`, which is why the same dashboard and the same policy engine run unchanged against a simulated chain and a live one.
+
+Four modules exist only because the project is deployable, and each answers one question the local build never had to ask:
+
+| Module | The question it answers |
+|---|---|
+| `src/lib/deployment.ts` | **What drives the cycle here?** `interval` (a `setInterval` in a long-lived process) or `cron` (an external scheduler calling `/api/tick`), decided from Vercel's own `VERCEL=1` marker. It also decides the real tick interval, whether a RUN TICK button may exist, and whether the dashboard must poll. |
+| `src/lib/blobJournal.ts` | **Where does the evidence live?** A Function's filesystem is read-only apart from a discarded `/tmp`, so on Vercel the append-only journal is rebuilt on Vercel Blob as per-writer segments. Local development keeps the filesystem journal untouched. |
+| `src/lib/tickAuth.ts` | **Who may make this agent spend?** `/api/tick` is the one endpoint that can move funds, and on a public URL holding a funded key it is behind a `CRON_SECRET` compared in constant time. It fails **closed**: a deployment with the check required and no secret set refuses every tick. |
+| `src/lib/spendGuard.ts` | **How much may it spend before someone looks?** A rolling 24-hour cap the agent enforces on itself, counted from the durable journal rather than from one process's memory. |
 
 ### API surface
 
@@ -281,56 +313,125 @@ Nothing above `src/lib/chain/` imports the Synapse SDK or can see a private key.
 | `GET /api/snapshot` | `{ snapshot: RunwaySnapshot, status: AgentStatus }` |
 | `GET /api/decisions?limit=N` | `{ decisions: Decision[], status: AgentStatus }` |
 | `GET /api/storage` | `{ storage: StorageListing, status: AgentStatus }`, or **503** with `{ error }` when the chain read fails. The gauge and decision feed do not depend on it, so it is allowed to fail alone rather than take the dashboard down. |
-| `POST /api/tick` | `{ decision: Decision, status: AgentStatus, coalesced: boolean }`. `coalesced: true` means a cycle was already in flight and this decision was **not** taken for this request. |
+| `POST /api/tick` <br> `GET /api/tick` | `{ decision: Decision, status: AgentStatus, coalesced: boolean }`. `coalesced: true` means a cycle was already in flight and this decision was **not** taken for this request. **The only route that can spend**, so it is the only one behind a shared secret: under the cron driver both verbs require `Authorization: Bearer $CRON_SECRET` (or `x-filrunway-tick-secret`) and answer **401** without it, **503** when the deployment has no secret configured at all. `GET` exists because that is the verb a scheduler uses; `POST` stays the operator's, and the local RUN TICK button's. Both run the identical handler — there is no unauthenticated back door on either. |
 | `GET /api/stream` | SSE: `snapshot`, `decision`, `tx`, `log`, `totals`, `notices`. The backlog replays first, then the whole current disclosure set. |
 
-`AgentStatus` carries `mode`, `address`, `tickIntervalMs`, `lastTickAt`, `nextTickAt`, plus `totals` (whole-history aggregates from the journal, **scoped to `mode`**), `journalPath` (the absolute path of this mode's journal file, or `null` when persistence is off or has disabled itself) and `notices` (the standing disclosures, oldest first, empty when there is nothing to disclose). `GET /api/decisions` serves the store's ring, which was hydrated under the same scope, so the feed a browser receives is single-mode by construction.
+`AgentStatus` carries `mode`, `address`, `tickIntervalMs`, `lastTickAt`, `nextTickAt`, plus `totals` (whole-history aggregates from the journal, **scoped to `mode`**), `journalPath` (where this mode's record is kept, or `null` when persistence is off or has disabled itself) and `notices` (the standing disclosures, oldest first, empty when there is nothing to disclose). `GET /api/decisions` serves the store's ring, which was hydrated under the same scope, so the feed a browser receives is single-mode by construction.
+
+Two of those fields are deployment-aware rather than constant. `tickIntervalMs` reports the schedule **actually in force** — 15,000 locally, 60,000 under the cron driver (`tickIntervalMs()`, `src/lib/deployment.ts:83`) — so the dashboard's NEXT TICK countdown never runs to a deadline nothing observes. `journalPath` is an absolute filesystem path locally and a `blob:filrunway/journal/<mode>/…` key on the deployment, prefixed so nobody reads it as a file on a disk that does not exist (`src/lib/blobJournal.ts:239`).
 
 ---
 
 ## The loop
 
-`ensureAgentLoop()` (`src/lib/agent.ts:336`) starts two timers on the first API request, lazily, so nothing schedules work during `next build`.
+The cycle is the same everywhere. What **drives** it is chosen from the environment rather than assumed, because the local answer is wrong on a serverless host and a wrong answer here silently decides whether the agent ticks at all. `agentDriver()` (`src/lib/deployment.ts:73`) reads Vercel's own `VERCEL=1` marker; `FILRUNWAY_AGENT_DRIVER` overrides it.
 
-| Timer | Interval | Constant | Job |
-|-------|----------|----------|-----|
-| sense | 2s | `SENSE_INTERVAL_MS` | Read the chain, publish a snapshot. Drives the gauge. |
-| tick | 15s | `TICK_INTERVAL_MS` | Full sense, decide, act cycle. |
+| Driver | Where | What starts the cycle | Interval |
+|---|---|---|---|
+| `interval` | `next dev`, `next start`, any long-lived process | `ensureAgentLoop()` (`src/lib/agent.ts:472`) sets two `setInterval` timers on the first API request, lazily, so nothing schedules work during `next build`. | sense 2s (`SENSE_INTERVAL_MS`), tick 15s (`TICK_INTERVAL_MS`) |
+| `cron` | Vercel | **Nothing in this process.** `ensureAgentLoop()` starts no timer and takes no tick; a Vercel Cron Job declared in `vercel.ts` issues `GET /api/tick` instead, authenticated with `CRON_SECRET`. | tick 60s (`CRON_TICK_INTERVAL_MS`, `src/lib/deployment.ts:49`) |
+
+That second row is the whole point of the split, and the reason it is a hard branch rather than a fallback. A Function exists for the length of one request, so a timer set inside it either never fires or fires on an instance nobody is looking at — and the *immediate* first tick the local loop performs would mean that merely **reading the dashboard** could cause the agent to spend. Under the cron driver no route may start a cycle as a side effect of being read.
 
 One tick, in order:
 
 ```
-1. sense()                       agent.ts:120  accountSummary + both wallet balances
+0. authorize                     tick/route.ts:35  under the cron driver, the shared
+                                  secret is checked BEFORE anything else runs, so an
+                                  unauthenticated caller cannot even provoke an RPC
+                                  read by being refused. 401 (or 503, no secret set).
+
+1. sense()                       agent.ts:166  accountSummary + both wallet balances
    read failed? --------------->  FAILED Decision recorded, agent HOLDs on stale data.
                                   An RPC outage is an audit-log entry, not a 500, and
                                   it renders as a red FAILED card carrying the error.
 
-2. evaluate(snapshot, RULES)     agent.ts:228  pure; Decision + reasoning string
+2. evaluate(snapshot, RULES)     agent.ts:314  pure; Decision + reasoning string
 
-3. journal + publish decision    store.ts:235  appended to the JSONL log BEFORE it
-                                  reaches the in-memory ring, then -> SSE -> the
+3. applySpendCap(decision)       agent.ts:315  (defined agent.ts:87) LIVE only. If the
+                                  decision wants to deposit and the agent has already
+                                  hit its own rolling 24h limit, the decision is
+                                  rewritten to SAFETY_CAP / NO_ACTION *before* it is
+                                  journalled, keeping the rule that fired and its
+                                  reasoning in front of the refusal.
+
+4. journal + publish decision    store.ts:375  appended to the durable journal BEFORE
+                                  it reaches the in-memory ring, then -> SSE -> the
                                   dashboard renders it immediately
 
-4. action == INSUFFICIENT_FUNDS? ->  return. outcome = NO_ACTION. Rule fired but
+5. action == SAFETY_CAP ? ---->  return. outcome = NO_ACTION. The agent declined
+                                  itself. Nothing was submitted and nothing may be.
+                                  agent.ts:326
+
+6. action == INSUFFICIENT_FUNDS? ->  return. outcome = NO_ACTION. Rule fired but
                                   the wallet can't cover it; no deposit attempted.
-                                  agent.ts:239
+                                  agent.ts:333
 
-5. action == HOLD ? ---------->  return. outcome = NO_ACTION. Nothing is sent.
+7. action == HOLD ? ---------->  return. outcome = NO_ACTION. Nothing is sent.
 
-6. deposit(amount)               agent.ts:260  payments.fund() -> real tx hash
+8. deposit(amount)               agent.ts:354  payments.fund() -> real tx hash
    publish tx event  SUBMITTED
+   recordSpend(...)              agent.ts:373  counted against the cap the moment it
+                                  reaches the chain, not when the journal is next read
 
-7. waitForTransaction(hash)      synapse.ts:387  waitForTransactionReceipt
+9. waitForTransaction(hash)      synapse.ts:387  waitForTransactionReceipt
    publish tx event  CONFIRMED | FAILED
    the updated Decision is journalled again, so the PENDING line and the
-   EXECUTED / FAILED line both survive on disk
+   EXECUTED / FAILED line both survive in the record.
+   FAILED? releaseSpend(id)      agent.ts:407  it did not stand, so it does not count
 
-8. sense() again                 so the gauge reflects the new balance at once
+10. sense() again                so the gauge reflects the new balance at once
+
+11. flushJournal()               agent.ts:276  runTick() does not return until the
+                                  record is actually durable. A Function instance can
+                                  be frozen the instant it responds, and a queued
+                                  journal write at that moment is a transaction with
+                                  no evidence behind it.
 ```
 
-Only one cycle runs at a time. A `POST /api/tick` that arrives mid-cycle does not start a second one and does not silently re-serve an older decision: the response carries `coalesced: true`, so a caller can tell that the decision it got back was not taken for its request (`runTick()`, `src/lib/agent.ts:171`).
+Only one cycle runs at a time. A tick that arrives mid-cycle does not start a second one and does not silently re-serve an older decision: the response carries `coalesced: true`, so a caller can tell that the decision it got back was not taken for its request (`runTick()`, `src/lib/agent.ts:251`).
 
-Steps 4 and 5 matter as much as step 6. A HOLD and an INSUFFICIENT_FUNDS decision are still decisions: both are recorded with full reasoning and rendered as visually distinct cards in the decision log — INSUFFICIENT_FUNDS gets a red, inverted card of its own, separate from the grey HOLD card. An agent that only logs when it acts, or that submits a transaction it already knows will fail, is not showing you its judgement.
+Steps 5, 6 and 7 matter as much as step 8. HOLD, SAFETY_CAP and INSUFFICIENT_FUNDS are all still decisions: each is recorded with full reasoning and rendered as its own card in the decision log. An agent that only logs when it acts, or that submits a transaction it already knows will fail, is not showing you its judgement.
+
+### The card taxonomy
+
+Five treatments, and the difference between the last two is the point (`DecisionFeed.tsx`, `DECLINE_STYLE` at line 65):
+
+| Decision | Card | Why that treatment |
+|---|---|---|
+| `HOLD` | Dashed grey, quiet | A resting state. It is recorded, with reasoning, but it is not an event. |
+| `TOP_UP` / `EMERGENCY_TOP_UP` | Action card, amber / red, with the tx row | Something happened and there is a hash to follow. |
+| outcome `FAILED` (any action) | Red failure card carrying the real error text | Outcome outranks action: a failure is a failure whether the agent was holding, topping up or blocked when it broke. |
+| `INSUFFICIENT_FUNDS` | Heavy **red** rail, inverted header, pill `BLOCKED`, footer *"Operator action required — fund the agent wallet."* | The agent is stuck until a human acts. |
+| `SAFETY_CAP` | Heavy **amber** rail, inverted header, pill `CAPPED`, footer *"Self-imposed limit — the agent declined to spend and will resume when the window rolls. No operator action required."* | The agent applied a limit it was given, on purpose, and will resume by itself. Painting that in alarm-red would misreport a working safety feature as a fault. |
+
+The two declining paths share a card component because they are the same kind of event — a rule fired, the agent recognised a constraint, nothing was submitted, there is no tx row — and are deliberately coloured apart because **one needs an operator and the other needs nobody** (`ACTION_VAR`, `src/lib/format.ts:47`).
+
+### The agent's own spending cap
+
+The policy engine is bounded per **decision**: a rule deposits 5 or 15 USDFC and no more. Nothing bounded it per **day**. That was survivable while the agent ran on a laptop with a human watching it; deployed, it runs unattended, on a public URL, holding a funded key, driven by a scheduler. A misread burn rate, an RPC that reports a runway of zero, or simply a schedule firing more often than anyone intended, and the agent would keep topping up — correctly, according to its rules — until the wallet was empty.
+
+So the agent is given a limit it enforces on itself (`src/lib/spendGuard.ts`):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `FILRUNWAY_MAX_DEPOSITS_24H` | `3` | Deposits allowed inside the window. |
+| `FILRUNWAY_MAX_DEPOSIT_USDFC_24H` | `20` | Total USDFC allowed inside the window. |
+| `FILRUNWAY_SPEND_WINDOW_MS` | `86400000` | Length of the rolling window. |
+| `FILRUNWAY_SPEND_CAP` | unset | `on` / `off` forces the cap regardless of mode. |
+
+The defaults are tight on purpose and are fitted to the shipped rule set: one emergency top-up (15) plus one scheduled top-up (5) is exactly 20 USDFC, so the agent can answer a genuine emergency in full and must then stop for the day.
+
+Four properties worth checking rather than taking on trust:
+
+- **It is enforced in LIVE only** (`spendCapEnabled()`, `src/lib/spendGuard.ts:126`). In MOCK nothing can be spent, and a mock run ticks every 15 seconds, so a conservative daily cap would fire within minutes and change the local demo into something it is not. `FILRUNWAY_SPEND_CAP=on` turns it on anyway.
+- **Hitting it is a decision, not an error.** `checkSpend()` (`src/lib/spendGuard.ts:179`) is pure — the caller supplies the history, the clock and the limits — and its refusal text is built there so the wording is identical wherever the cap fires and can be asserted in a test rather than eyeballed in a screenshot. `applySpendCap()` turns that refusal into a `SAFETY_CAP` decision with `outcome: NO_ACTION`, journalled like any other.
+- **The window is counted from the durable journal, not from process memory** (`spendEntriesFrom()`, `src/lib/spendGuard.ts:240`, seeded into `AgentStore.spendEntries()` on every hydrate and refresh). On Vercel each tick may run on a different Function instance, and a cap that resets whenever an instance is recycled is not a cap.
+- **A deposit counts once it has EXECUTED, for the amount the rule asked for** — the same definition `accumulate()` totals in `journal.ts`, so the cap and the AUTONOMOUS DEPOSITS tile can never disagree about what was spent. A submitted transaction that then fails to confirm is released again (`releaseSpend()`, `src/lib/store.ts:455`).
+
+While the cap is in force the agent pins a standing disclosure stating the limits, so a viewer who arrives after a `CAPPED` card can still see what limit it was that fired: *"Safety cap in force: at most 3 deposits and 20.00 USDFC per 24h. Reaching it records a declining decision; it never transacts."*
+
+**One honest limit on the guarantee.** Across Function instances the cap is eventually consistent, not transactionally exact. Each instance seeds its window from the shared journal and re-reads it on a 3-second TTL (`REFRESH_TTL_MS`, `src/lib/store.ts:60`), so two ticks landing on two instances inside the same 3-second window could each believe the other's deposit had not happened. At one tick a minute — the deployed schedule — that race is not reachable, and inside a single instance the cap is exact because a deposit is counted the moment it reaches the chain. But it is a refresh window, not a lock, and this README would rather say so than let it be discovered.
 
 ### The policy
 
@@ -342,7 +443,16 @@ Steps 4 and 5 matter as much as step 6. A HOLD and an INSUFFICIENT_FUNDS decisio
 | `topup-7d` | runway < 7 days | `TOP_UP` | 5 USDFC |
 | `hold` | otherwise | `HOLD` | 0 |
 
-A rule can only ever ask for `TOP_UP`, `EMERGENCY_TOP_UP` or `HOLD` — `PolicyAction` has no fourth option, so this table cannot be configured to produce one. `evaluate()` can still conclude a fourth, un-configurable outcome, `INSUFFICIENT_FUNDS`: if the rule that fires wants a deposit larger than the wallet holds, the engine reports the shortfall instead of returning the rule's action, and `outcome` is `NO_ACTION` rather than `PENDING`. Nothing is submitted, so there is nothing to fail on-chain. This is reachable in live mode whenever the wallet is genuinely short; in mock mode the wallet starts at 250 USDFC, so the default demo never reaches it, and doing so on purpose takes roughly 16 emergency top-ups.
+A rule can only ever ask for `TOP_UP`, `EMERGENCY_TOP_UP` or `HOLD` — `PolicyAction` has no fourth option (`src/lib/types.ts:44`), so this table cannot be configured to produce one. The agent can still reach **two further conclusions of its own**, neither of which any rule can request, and both of which decline to transact with a stated reason (`DecisionAction`, `src/lib/types.ts:62`):
+
+| Conclusion | Where it is decided | When |
+|---|---|---|
+| `INSUFFICIENT_FUNDS` | `evaluate()`, `src/lib/policy.ts:162`. Pure. | The rule that fired wants a deposit larger than the wallet holds. The engine reports the shortfall instead of returning the rule's action. |
+| `SAFETY_CAP` | `applySpendCap()`, `src/lib/agent.ts:87`. Deliberately **outside** `policy.ts`. | The wallet could cover it, but the agent has already made 3 deposits, or deposited 20 USDFC, inside the rolling 24-hour window. |
+
+`SAFETY_CAP` lives outside the policy engine for a reason worth stating: `evaluate()` is pure, and answering *"how much have I spent in the last 24 hours?"* needs the durable history that only the store has. Keeping the impure question out of the pure function is what lets the policy stay trivially testable.
+
+Both set `outcome` to `NO_ACTION` rather than `PENDING`, and in both cases nothing is submitted, so there is nothing to fail on-chain. `INSUFFICIENT_FUNDS` is reachable in live mode whenever the wallet is genuinely short; in mock mode the wallet starts at 250 USDFC, so the default demo never reaches it, and doing so on purpose takes roughly 16 emergency top-ups. `SAFETY_CAP` is reachable in **live mode only** by default — see ["The agent's own spending cap"](#the-agents-own-spending-cap) — and on the shipped defaults a fourth top-up in a day, or any top-up that would carry the day's total past 20 USDFC, is enough to reach it.
 
 `evaluate()` is pure: `(RunwaySnapshot, PolicyRule[]) -> Decision`. No clock read unless you inject one, no chain call, no side effect. That is deliberate. The part a judge is most likely to be suspicious of should be the part that is easiest to test. 25 unit tests in `src/lib/policy.test.ts` cover threshold boundaries, rule ordering, the unbounded-runway sentinel, wallet-shortfall detection and the reasoning text. The orchestration around it is no longer taken on trust either: `src/lib/agent.test.ts` drives `runTick()` against a scripted adapter (a read that throws, a deposit that reverts, a transaction that never confirms, a tick that arrives mid-cycle) with no network and no key.
 
@@ -367,7 +477,30 @@ No deposit attempted: fund the agent wallet with at least 12.00 USDFC for this
 rule to execute.
 ```
 
-Those three are at `FILRUNWAY_DEMO_SCALE=1`. When a demo timescale is in force the thresholds quoted in the reasoning are the **scaled** ones, and every decision appends its own disclosure sentence (`demoScaleNote()`, `src/lib/demo.ts:149`) so a decision card screenshotted on its own still says what it was compared against. At `×480` the same TOP_UP reads:
+A `SAFETY_CAP` decision keeps the reasoning the agent had already written — what it *wanted* to do, and why — and appends the refusal behind it, because the record has to show both. The refusal names the limit that was hit, the amounts on both sides of it, when the cap next relaxes, and the variable that widens it. The count limit:
+
+```
+Runway 1.7 days (4,896 epochs) is below the 2-day emergency top-up threshold.
+Burn rate 0.00041 USDFC/epoch against 1.44 USDFC available. Depositing 15 USDFC
+extends runway to ~19.9 days. Declined by the agent's own safety cap: 3 of a
+maximum 3 deposits already made in the last 24h (15.00 USDFC). No transaction
+was attempted and no funds moved. The cap relaxes as the oldest deposit ages out
+at 2026-09-03 09:14:02 UTC. Raise FILRUNWAY_MAX_DEPOSITS_24H to widen the cap.
+```
+
+And the amount limit, which can fire well before the third deposit:
+
+```
+Runway 1.7 days (4,896 epochs) is below the 2-day emergency top-up threshold.
+Burn rate 0.00041 USDFC/epoch against 1.44 USDFC available. Depositing 15 USDFC
+extends runway to ~19.9 days. Declined by the agent's own safety cap: this rule
+calls for 15 USDFC on top of 10.00 USDFC already deposited in the last 24h,
+which would reach 25.00 USDFC against a cap of 20.00 USDFC. No transaction was
+attempted and no funds moved. The cap relaxes as the oldest deposit ages out at
+2026-09-03 09:14:02 UTC. Raise FILRUNWAY_MAX_DEPOSIT_USDFC_24H to widen the cap.
+```
+
+Those four are at `FILRUNWAY_DEMO_SCALE=1`. When a demo timescale is in force the thresholds quoted in the reasoning are the **scaled** ones, and every decision appends its own disclosure sentence (`demoScaleNote()`, `src/lib/demo.ts:149`) so a decision card screenshotted on its own still says what it was compared against. At `×480` the same TOP_UP reads:
 
 ```
 Runway 2969.9 days (8,553,196 epochs) is below the 3360-day top-up threshold.
@@ -438,7 +571,7 @@ NEXT_PUBLIC_FILRUNWAY_DEMO_SCALE=480
 # FILRUNWAY_DECISION_LOG=
 ```
 
-`.env.example` carries the same guidance: both scale variables (defaulted to `1`, off), and `FILRUNWAY_DECISION_LOG` left commented out, with the per-mode default paths and the reason to leave it that way spelled out in the comment above it.
+`.env.example` carries the same guidance: both scale variables (defaulted to `1`, off), and `FILRUNWAY_DECISION_LOG` left commented out, with the per-mode default paths and the reason to leave it that way spelled out in the comment above it. It also documents every deployment variable — the driver, the cron schedule and its interval, the tick secret, the Blob journal and the spending cap — each commented out, with values never filled in, so the same eleven appear there and in the table in ["Deploying to Vercel"](#deploying-to-vercel). Nothing below this point in the setup is needed to run locally; see ["Deploying to Vercel"](#deploying-to-vercel) when you want it on the internet.
 
 ### 4. Smoke-test the chain before touching the UI
 
@@ -474,7 +607,7 @@ Re-run `bootstrap -- status`. It now prints a real runway and, if that runway is
 npm run dev          # http://localhost:3000
 ```
 
-The agent starts on the first request to any API route and ticks every 15 seconds from then on. `RUN TICK NOW` in the status strip forces a cycle early; it is a convenience, not the mechanism.
+The agent starts on the first request to any API route and ticks every 15 seconds from then on. `RUN TICK NOW` in the status strip forces a cycle early; it is a convenience, not the mechanism. **That button is local-only** — it is absent from the deployed build, where `/api/tick` requires a secret a public page must never carry. See ["Deploying to Vercel"](#deploying-to-vercel).
 
 ### Full CLI surface
 
@@ -498,21 +631,149 @@ npm run decisions -- --limit 100                   show more than the default 20
 npm run decisions -- --executed                    only decisions that moved money
 npm run decisions -- --id <decisionId>             one decision in full (searches every mode)
 npm run decisions -- --json                        raw {mode, decision} records, for jq
+npm run decisions -- --remote                      read the DEPLOYED agent's Blob journal
 npm run decisions -- --split                       copy MOCK records out of the LIVE journal (dry run)
 npm run decisions -- --split --write               actually apply that copy
 ```
 
-No key, no RPC, no server. Every row carries its mode, and the `transactions the agent authored` section is LIVE-only at every scope. See "Proving the agent authored the transaction" above.
+No key and no server, ever. The default form reads the local files and needs no network; `--remote` reads the deployed agent's Vercel Blob journal and needs `BLOB_READ_WRITE_TOKEN` (`vercel env pull .env.local`). Every row carries its mode, and the `transactions the agent authored` section is LIVE-only at every scope, against either source. See "Proving the agent authored the transaction" above.
 
 ### Other scripts
 
 ```bash
-npm run test         # 239 unit tests, 10 files
+npm run test         # 332 unit tests, 17 files
 npm run typecheck
 npm run lint
 ```
 
-Per file: `journal` 44, `units` 27, `demo` 27, `policy` 25, `chain/synapse` 25 (pure helpers), `agent` 23, `journalReport` 21, `format` 20, `decisions` 18, `stream/route` 9.
+Per file: `journal` 44, `demo` 27, `units` 27, `chain/synapse` 25 (pure helpers), `policy` 25, `agent` 23, `journalReport` 21, `format` 20, `spendGuard` 20, `tickAuth` 19, `decisions` 18, `blobJournal` 17, `deployment` 12, `agentSpendCap` 10, `api/stream/route` 9, `api/tick/route` 9, `agentSnapshot` 6.
+
+---
+
+## Deploying to Vercel
+
+The local agent is a `setInterval` in a process that stays alive. A Vercel Function exists for the length of one request, so that timer either never fires or fires on an instance nobody is looking at. Deploying therefore meant answering four questions the local build never had to — what drives the cycle, where the evidence lives, who is allowed to make the agent spend, and how much it may spend unattended — which is what `src/lib/deployment.ts`, `src/lib/blobJournal.ts`, `src/lib/tickAuth.ts` and `src/lib/spendGuard.ts` are.
+
+> ### Read this first: cron granularity is plan-gated
+>
+> Vercel Cron's schedule resolution depends on your plan. **Hobby projects are limited to a small number of cron jobs that run at most about once a day, and the run may be up to an hour late.** Per-minute schedules need **Pro**. A once-a-day agent is a poor demo and a badly misleading one, since the dashboard's NEXT TICK countdown would be describing a schedule nobody would sit through.
+>
+> On Hobby, do this instead — it is exactly as autonomous, and the code cannot tell the difference:
+>
+> 1. Set `FILRUNWAY_CRON_SCHEDULE` to something the plan accepts (for example `0 0 * * *`), so the deployment builds and the platform is satisfied.
+> 2. Drive the real cadence from an **external scheduler** — [cron-job.org](https://cron-job.org), a GitHub Actions `schedule:` workflow, or anything else that can issue an HTTP request — calling `GET https://<your-deployment>/api/tick` with the **same** `Authorization: Bearer $CRON_SECRET` header Vercel Cron would have sent.
+> 3. Optionally set `FILRUNWAY_CRON_INTERVAL_MS` to that external cadence, so the dashboard's NEXT TICK countdown describes the schedule actually in force rather than the 60s default.
+>
+> Nothing about the agent changes: `/api/tick` is one handler behind one secret, and it does not know or care which scheduler called it.
+>
+> **`FILRUNWAY_CRON_SCHEDULE` is read at BUILD time.** `vercel.ts` is compiled on the build machine, where project environment variables are available, so changing that one variable requires a **redeploy**. Every other variable below is read at runtime and does not.
+
+### The steps, in order
+
+```bash
+# 1. Vercel CLI
+npm i -g vercel
+vercel login
+
+# 2. Link this directory to a Vercel project
+vercel link
+
+# 3. Create a Blob store  ->  Vercel dashboard: Storage > Create > Blob,
+#    then connect it to this project.
+#    This INJECTS BLOB_READ_WRITE_TOKEN into the project's environment.
+#    Never set that variable by hand.
+
+# 4. Generate the tick secret
+openssl rand -hex 32
+
+# 5. Set the environment variables (see the table below) on the project,
+#    in BOTH Production and Preview. A preview deployment with no secret
+#    refuses every tick; a preview deployment with no Blob store keeps no
+#    record of the ones it does run.
+vercel env add CRON_SECRET production
+vercel env add CRON_SECRET preview
+#    ... and likewise FILECOIN_PRIVATE_KEY, FILRUNWAY_MODE, the demo scale pair, etc.
+
+# 6. Deploy
+vercel deploy --prod
+```
+
+Step 3 is the one people skip. `BLOB_READ_WRITE_TOKEN` is **injected by the platform** when a Blob store is connected to the project — you do not paste it anywhere, and you should not add it as a manual environment variable. Locally, pull it down with `vercel env pull .env.local` when you want to read the deployed journal with `npm run decisions -- --remote`.
+
+### Environment variables
+
+Everything in ["Setup from zero"](#setup-from-zero) still applies — `FILRUNWAY_MODE`, `FILECOIN_PRIVATE_KEY`, `FILECOIN_RPC_URL`, and both halves of the demo-scale pair. These are the eleven the deployment adds. **Values are never printed here or anywhere else in this repo.**
+
+| Variable | Set it? | What it does |
+|---|---|---|
+| `CRON_SECRET` | **Yes, before the first deploy** | The shared secret `/api/tick` requires, compared in constant time (`src/lib/tickAuth.ts:70`). Vercel's own name for it, so Vercel Cron sends `Authorization: Bearer $CRON_SECRET` on every scheduled invocation with no extra wiring. A deployment that requires the check and has no secret **refuses every tick with 503** rather than falling open. Generate with `openssl rand -hex 32`. |
+| `BLOB_READ_WRITE_TOKEN` | **Never by hand** | Injected when a Blob store is connected. Without it, a deployment's journal disables itself loudly and pins a warning, rather than silently writing to a `/tmp` that is about to be discarded. |
+| `FILRUNWAY_CRON_SCHEDULE` | Only off Pro | The cron expression compiled into `vercel.ts`. Default `* * * * *`. **Read at build time — changing it needs a redeploy.** |
+| `FILRUNWAY_CRON_INTERVAL_MS` | Optional | What the dashboard should believe the tick cadence is, in ms. Default 60,000. Set it when an external scheduler, not Vercel Cron, is driving the real cadence, so NEXT TICK counts down to something real. |
+| `FILRUNWAY_AGENT_DRIVER` | Rarely | Forces `interval` or `cron`, overriding the `VERCEL=1` detection. Its purpose is a self-hosted long-running deployment that wants to keep the in-process timer. Anything other than those two literals is ignored rather than trusted — a typo must not silently disable the agent. |
+| `FILRUNWAY_REQUIRE_TICK_AUTH` | No (tests only) | Forces the tick secret check on (`1`/`true`) or off (`0`/`false`) regardless of driver. |
+| `FILRUNWAY_BLOB_PREFIX` | Optional | Where in the Blob store the journal lives. Default `filrunway/journal`. Useful to give two deployments separate records in one store. |
+| `FILRUNWAY_MAX_DEPOSITS_24H` | Optional | Deposits the agent will allow itself inside the rolling window. Default `3`. |
+| `FILRUNWAY_MAX_DEPOSIT_USDFC_24H` | Optional | Total USDFC it will allow itself inside the window. Default `20`. |
+| `FILRUNWAY_SPEND_WINDOW_MS` | Optional | Length of that window. Default `86400000` (24h). |
+| `FILRUNWAY_SPEND_CAP` | Optional | `on` / `off`, forcing the cap regardless of mode. Unset, it is enforced in LIVE and not in MOCK. |
+
+**`FILRUNWAY_DECISION_LOG`: do not set it on Vercel.** It names a filesystem path, and a Function's filesystem is read-only apart from an ephemeral `/tmp`. On a deployment with a Blob store connected, `selectJournal()` (`src/lib/blobJournal.ts:541`) honours exactly one value of it — `off`, which disables persistence entirely — and ignores any path, because a path there would be either an error or a `/tmp` file discarded with the instance. Setting it to `off` on a deployment means the agent's decisions leave no record at all, which is the one thing this project's autonomy claim cannot survive. Leave it unset.
+
+### Verifying the deployment
+
+Run these in order. Each one fails loudly if the step before it was skipped.
+
+1. **The cron job is registered.** Vercel dashboard → your project → **Settings → Cron Jobs**. `/api/tick` must be listed with the schedule you expect. If the list is empty, `vercel.ts` did not compile into the build — check that there is no stray `vercel.json` competing with it.
+2. **The endpoint is closed.**
+
+   ```bash
+   curl -i https://<your-deployment>/api/tick
+   ```
+
+   Expect **`HTTP/2 401`** and a body saying the endpoint requires the deployment's shared secret. A **200** here means the deployment is spending on anyone's request — stop and fix `CRON_SECRET`. A **503** means the check is required and no secret is configured; the agent is safely doing nothing, and you need to set the variable and redeploy.
+3. **The endpoint is open to the right caller.**
+
+   ```bash
+   curl -i -X POST https://<your-deployment>/api/tick \
+     -H "Authorization: Bearer $CRON_SECRET"
+   ```
+
+   Expect **200** and a JSON body with `decision`, `status` and `coalesced`. `coalesced: true` just means a cycle was already running.
+4. **The dashboard agrees.** Open the deployment. You should see:
+   - the `LIVE · CALIBRATION` badge (green, outlined) — correct on the **first painted frame**, because the mode is resolved server-side;
+   - a dashed **`CRON DRIVEN`** chip where the RUN TICK button sits locally, with a tooltip explaining that the cycle is scheduled and the page would have to carry the secret to send one;
+   - **no `RUN TICK NOW` button at all** — not a greyed-out one, because a disabled control invites a visitor to try;
+   - a pinned `driver-cron` notice above the AGENT TRACE saying the agent is driven by a scheduled call to `/api/tick`, and a pinned `spend-cap` notice stating the deposit limits in force;
+   - `NEXT TICK` counting down from 60 seconds, not 15.
+5. **Watch it act with nobody touching it.** Leave the page open, hands off, for about two minutes. Decisions appear on their own. This is the strongest single demonstration the project has, and it is stronger than the local one: locally, opening the dashboard is what starts the loop. Here, nothing you do in the browser can cause a tick — the page cannot even authenticate one.
+6. **Read the deployed record from your own machine.**
+
+   ```bash
+   vercel env pull .env.local
+   npm run decisions -- --remote
+   npm run decisions -- --remote --executed
+   npm run decisions -- --remote --id <id>
+   ```
+
+   Same parser, same mode scoping, same evidence section as the local reader. The `file` row reads `blob:filrunway/journal/` instead of a path.
+
+### What is different on the deployment, honestly
+
+Everything here is a real difference a viewer can notice. None of it is hidden by the UI.
+
+| | Local (`npm run dev`) | Deployed (Vercel) |
+|---|---|---|
+| What drives a tick | `setInterval` in this process | Vercel Cron (or any scheduler) calling `GET /api/tick` |
+| Tick interval | 15s | 60s, and `AgentStatus.tickIntervalMs` reports it, so NEXT TICK is honest |
+| `RUN TICK NOW` | Present | **Absent.** Replaced by a `CRON DRIVEN` chip. The page would have to carry `CRON_SECRET` to press it, and that would publish the secret to everyone who opens the URL |
+| `journalPath` on screen | An absolute path, e.g. `D:\Filecoin_TLDR\data\decisions.jsonl` | `blob:filrunway/journal/live/…` |
+| Gauge anchor readings | A fresh chain read every 2s (`SENSE_INTERVAL_MS`) | Every 10s at most (`REMOTE_SENSE_TTL_MS`, `src/lib/agent.ts:194`) — a TTL-gated shared cache, because that read is reachable from a public GET. The needle is smoother locally |
+| Decision latency to the browser | Immediate — the tick and the SSE stream are the same process | Up to ~5s. The tick ran in one Function instance and the stream is held by another, so the page polls the shared journal every 5s (`REMOTE_POLL_MS`, `src/lib/deployment.ts:55`) and the stream republishes what the poll finds |
+| SSE connection lifetime | Until you close the tab | Cut by the platform at `maxDuration` **300s** (`vercel.ts:68`). `EventSource` reconnects on its own (`retry: 3000`), the backlog replays, and the **whole pinned disclosure set is re-sent in full** on every connect — so a reconnect restates the disclosures rather than appending duplicates or losing them |
+| Spending cap | Not enforced (MOCK), or enforced exactly within one process (LIVE) | Enforced across instances, but **eventually consistent** on a 3s refresh window rather than transactionally exact. Not reachable at one tick a minute; true anyway, and said here rather than discovered |
+| `npm run bootstrap` | Full operator CLI | **Not reachable.** It is a local script, not a route: nothing on the deployment exposes `status`, `approve`, `fund`, `upload` or `datasets`. Run it against the same wallet from your own machine |
+| `npm run decisions` | Reads `data/*.jsonl` | Add `--remote` to read the deployment's Blob journal |
 
 ---
 
@@ -577,7 +838,7 @@ When scaling is active the UI and the audit trail say so in three independent pl
 2. Every rule label — including HOLD's, which carries no suffix of its own — is suffixed `×480 DEMO` and shows the *effective* (scaled) day figure next to its comparison operator, not the base one. At `×480` a card reads `SCHEDULED TOP-UP < 3,360d ×480 DEMO` or `HOLD >= 3,360d ×480 DEMO`, never the unscaled `< 7d` / `>= 7d`. This is `ruleLabel()` (`src/lib/format.ts`): a normal rule's threshold was already multiplied by `scaleRules()` upstream, while HOLD — the policy's catch-all rule, whose threshold is a `Number.MAX_SAFE_INTEGER` sentinel that must never be multiplied — has its figure substituted with `DEMO_BAND_WARNING_DAYS`, the same scaled top-up threshold, and gets the `×N DEMO` suffix appended explicitly, so all three decision cards read alike.
 3. Every decision's `reasoning` now ends with its own disclosure sentence, e.g. `Threshold shown is the 7-day rule at the ×480 demo timescale.` (`demoScaleNote()`, `src/lib/demo.ts:149`). This matters because a decision card is routinely screenshotted with the gauge header out of frame; without it, "below the 3360-day top-up threshold" would carry no hint that 3,360 is 7 × 480. At scale 1 the sentence is the empty string and nothing is added anywhere.
 
-The agent also logs a warning line into the trace on startup whenever a timescale is in force. Unlike the journal disclosures above, that banner deliberately stays an ordinary trace line rather than a durable `AgentNotice` — `src/lib/agent.ts:355-364` calls `log()`, not `notice()`, because the three places just listed already state the scale permanently and a late-arriving viewer cannot miss it. Durability is spent only where the fact would otherwise be unobtainable.
+The agent also logs a warning line into the trace on startup whenever a timescale is in force. Unlike the journal disclosures above, that banner deliberately stays an ordinary trace line rather than a durable `AgentNotice` — `src/lib/agent.ts:502-511` calls `log()`, not `notice()`, because the three places just listed already state the scale permanently and a late-arriving viewer cannot miss it. Durability is spent only where the fact would otherwise be unobtainable.
 
 One thing the disclosures do **not** promise: that every card in the feed quotes the same scale. A card restored from the journal shows the threshold and suffix recorded with it, so a feed containing history from an earlier run at a different scale will show both. Each card is individually correct about the decision it describes. See limitation 9.
 
@@ -602,7 +863,9 @@ One configuration trap, and the agent now catches it for you: the gauge is a cli
 | Policy thresholds and gauge graduations | **Scaled** by `FILRUNWAY_DEMO_SCALE`. See above. |
 | STORED DATA panel | Real. `ChainAdapter.listStorage()` reads the account's Warm Storage data sets, providers, sizes and active piece CIDs from the chain. Served by `/api/storage`; a failed read is a 503 the panel prints, never a placeholder row. |
 | Gauge numeral, its epoch subtitle, and its band colour | **Not raw.** Interpolated client-side from a *measured* rate, anchored on the last real reading and capped at 8s of extrapolation. Every server reading snaps it back to truth. See "Which numbers on screen are raw, and which are interpolated" above. |
-| Decision history | Real and **durable**. Appended to an append-only JSONL journal (`data/decisions.jsonl` in live mode, `data/decisions.mock.jsonl` in mock), stamped MOCK / LIVE per line, and rehydrated into the store on start **scoped to the running mode**, so simulated spend can never be totalled as real. Read it with `npm run decisions`. |
+| Decision history | Real and **durable**. Appended to an append-only JSONL journal, stamped MOCK / LIVE per line, and rehydrated into the store on start **scoped to the running mode**, so simulated spend can never be totalled as real. On disk locally (`data/decisions.jsonl` in live, `data/decisions.mock.jsonl` in mock); as append-only JSONL segments in Vercel Blob on the deployment, through the same parser. Read either with `npm run decisions`, adding `--remote` for the deployed one. |
+| The spending cap | Real, and enforced against real money. At most 3 deposits and 20 USDFC per rolling 24h by default, counted from the durable journal. Reaching it records a `SAFETY_CAP` decision and submits nothing. LIVE only — see ["The agent's own spending cap"](#the-agents-own-spending-cap). |
+| `/api/tick` authentication | Real on the deployment. `CRON_SECRET`, compared in constant time, required on both verbs; a deployment with the check required and no secret refuses every tick rather than falling open. Open on localhost, where the endpoint is not reachable from the internet and the default mode has no funds. |
 
 **The headline proof — cite this one.** The transaction the decision journal actually backs is [`0x06e27a6a…`](https://calibration.filfox.info/en/message/0x06e27a6a7fd532722727953b8d266f14d8109aaaa2c9edc8645bf17a1a2fcf6b) (status success, block 4,034,196, to the Filecoin Pay contract, 5 USDFC), paired with decision `1b2d98ef-4984-482f-b394-498ea99b29a6`. Run `npm run decisions -- --id 1b2d98ef-4984-482f-b394-498ea99b29a6` and it prints the reading, the rule that fired, the reasoning, and this exact hash — the one place in this README where the proof command and the hash it names actually match, because it is the one hash the journal contains.
 
@@ -636,14 +899,14 @@ Ordered roughly by how much they would matter in production.
 
 1. **Top-up only.** The brief allows three responses: top up, cut what you cannot afford, or decide what is worth paying to keep. This implements the first. There is no eviction, data-set termination or value-ranking path. `PolicyAction` is `TOP_UP | EMERGENCY_TOP_UP | HOLD` and nothing else.
 2. **No partial top-up.** If the wallet holds less USDFC than a fired rule wants to deposit, the agent recognises this before acting: `evaluate()` returns `INSUFFICIENT_FUNDS` (outcome `NO_ACTION`), and `runTick()` returns before calling `deposit()`, so nothing is submitted and nothing can fail on-chain. It still does not deposit whatever partial balance is available, or down-shift to a smaller amount — an operator has to fund the wallet before the next tick can act. That down-shift is a reasonable future improvement.
-3. **Single-writer journal.** Decisions themselves are durable: `src/lib/journal.ts` appends every decision, and every later status transition of it, to a JSON Lines file that `src/lib/store.ts` rehydrates on start. What is *not* solved is concurrency and scale — the file is appended with `appendFileSync` from one single-threaded process, so two servers sharing one path would interleave and each would need its own `FILRUNWAY_DECISION_LOG`. (Two servers in *different* modes already get different files by default, so this is only a hazard for two servers in the same mode.) The in-memory ring in front of it is still capped (200 decisions, 400 events), which bounds what the UI holds and nothing else; anything that ages out of the ring is folded into the server-side `totals` rather than lost. `store.backlog()` (`src/lib/store.ts:319`) is documented in code as a rolling tail that nothing durable may depend on, and the startup disclosures are exempt from aging out precisely because they travel as `notices` state rather than as backlog content. A journal that cannot be written disables itself with a warning and the agent carries on in memory, so a disk problem degrades the record rather than stopping the agent. It is an append-only evidence file, not a database.
-4. **The agent runs inside the web process.** `ensureAgentLoop()` starts `setInterval` timers from a route handler. Fine for a local demo, wrong for a serverless deployment where those timers would not survive.
+3. **The local journal is single-writer; the deployed one is not, but neither is a database.** Decisions themselves are durable: every decision, and every later status transition of it, is appended to a JSON Lines record that `src/lib/store.ts` rehydrates on start. Locally that is `appendFileSync` from one single-threaded process, so two servers sharing one path would interleave and each would need its own `FILRUNWAY_DECISION_LOG`. (Two servers in *different* modes already get different files by default, so this is only a hazard for two servers in the same mode.) On Vercel that constraint is genuinely solved rather than inherited: `src/lib/blobJournal.ts` gives every writer its own segment objects (`filrunway/journal/<mode>/<startedAt>-<instance>-<part>.jsonl`), sealed at 50 lines, so there is no read-modify-write of a shared object and two Function instances ticking at the same moment cannot lose each other's lines. What is still *not* solved anywhere is querying and indexing — a read lists the whole prefix and concatenates it. The in-memory ring in front of it is still capped (200 decisions, 400 events), which bounds what the UI holds and nothing else; anything that ages out of the ring is folded into the server-side `totals` rather than lost. `store.backlog()` (`src/lib/store.ts:508`) is documented in code as a rolling tail that nothing durable may depend on, and the startup disclosures are exempt from aging out precisely because they travel as `notices` state rather than as backlog content. A journal that cannot be written disables itself with a warning and the agent carries on in memory, so a storage problem degrades the record rather than stopping the agent. It is an append-only evidence log, not a database.
+4. **Two drivers, and only one of them is a timer.** `agentDriver()` (`src/lib/deployment.ts:73`) reads Vercel's own `VERCEL=1` marker and picks: `interval`, where `ensureAgentLoop()` starts `setInterval` timers from a route handler and a long-lived process owns them, or `cron`, where it starts **nothing** and an external scheduler calls `GET /api/tick` instead. The local timer is correct for `next dev` and `next start` and meaningless on a Function that lives for one request, so the deployed build does not pretend otherwise — and, importantly, under the cron driver no route may start a cycle as a side effect of being read, so merely opening the dashboard cannot make the agent spend. The residual limitation is that the two paths are genuinely different code: the cron path is covered by `src/lib/deployment.test.ts`, `src/lib/tickAuth.test.ts`, `src/lib/blobJournal.test.ts` and `src/app/api/tick/route.test.ts`, but a long-running deployment has not been observed for days at a time. See limitation 10.
 5. **Hot key in a file.** `FILECOIN_PRIVATE_KEY` sits in `.env` (or `.env.local` — see setup above, either is loaded). It is confined to two modules and scrubbed out of every error message that escapes them, but it is still a hot key. Testnet only.
-6. **No backoff.** A failed deposit is recorded and retried on the next 15-second tick with the same amount. No exponential backoff, no circuit breaker, no retry cap.
+6. **No backoff, though there is now a ceiling.** A failed deposit is recorded and retried on the next tick with the same amount, with no exponential backoff and no per-error retry cap. What it can no longer do is retry forever at the agent's own expense: `src/lib/spendGuard.ts` caps successful deposits at 3, and 20 USDFC, per rolling 24 hours in LIVE mode, and a retry that would cross either limit becomes a `SAFETY_CAP` decision instead of a transaction. That is a spend ceiling rather than a circuit breaker — it bounds the money, not the number of attempts, and a *failed* deposit consumes no cap because only EXECUTED decisions are counted. Proper backoff on the failure path is still the right improvement.
 7. **`getStoredItems()` in live mode lists only this process's own uploads**, not an onchain enumeration — it is empty on a freshly started server. The onchain answer is `ChainAdapter.listStorage()`, which is what `/api/storage` and the dashboard's STORED DATA panel use; `bootstrap -- datasets` prints the same thing from the CLI.
 8. **The live gauge barely moves, and the demo timescale does not change that.** At roughly $0.008/day of real burn (0.240005 USDFC/month, measured live), a runway of thousands of days does not visibly count down over a two-minute video. `FILRUNWAY_DEMO_SCALE` scales thresholds, not the burn rate, so runway still falls at about a day per real day and no threshold is ever *fallen through* on camera. The visible drain is a mock-mode phenomenon. In live mode the decision moment comes from where the runway *is* relative to the scaled threshold, and from the flip back to HOLD that the deposit itself causes, not from watching a needle fall.
 9. **A restored decision card carries the rule label captured when the decision was taken.** This is within-mode staleness, not mode mixing, and it is pre-existing. `ruleLabel()` rewrites the day figure of the *catch-all* HOLD rule from the scale currently in force, but a rule that actually fired (`topup-7d`, `emergency-2d`) was scaled by `scaleRules()` at decision time and carries both its scaled `thresholdDays` and its `×N DEMO` suffix inside the stored `ruleFired.label`. So a mock session recorded at `×380` still displays `×380 DEMO` on its restored cards even when the current session runs at `×480`. That is correct as history — the card says what the agent actually compared against — but it does mean two cards in one feed can quote two different scales. The gauge badge, and every decision's own `reasoning` disclosure sentence, always state the scale that decision was taken at.
-10. **Not verified against a long-running live deployment.** 239 unit tests cover the pure logic (policy, demo scaling, units, formatting, decision merging), the journal and its mode scoping, the reader-side mode policy in `src/lib/journalReport.ts`, the live adapter's helpers against the SDK's return shapes, and — since `src/lib/agent.test.ts` — the orchestration in `runTick()` against a scripted adapter. `src/app/api/stream/route.test.ts` goes one step further and drives the real route handler with a real `Request`, so the backlog window, the frame encoding and the connect order are tested rather than assumed — still unit-level, integration-lite, and no substitute for a live deployment. What they do not cover is sustained multi-hour live behaviour, RPC flakiness under load, and provider-side upload failures, none of which have been exercised at length.
+10. **Not verified against a long-running live deployment.** 332 unit tests across 17 files cover the pure logic (policy, demo scaling, units, formatting, decision merging), the journal and its mode scoping, the reader-side mode policy in `src/lib/journalReport.ts`, the live adapter's helpers against the SDK's return shapes, the orchestration in `runTick()` against a scripted adapter, and every deployment-shaped module: driver selection (`deployment.test.ts`), the constant-time secret check and its fail-closed behaviour (`tickAuth.test.ts`), the Blob journal's segmenting, sealing, re-read avoidance and mode scoping against an injected IO fake (`blobJournal.test.ts`), and the spend cap both as pure arithmetic (`spendGuard.test.ts`) and end-to-end through `runTick()` (`agentSpendCap.test.ts`). `src/app/api/stream/route.test.ts` and `src/app/api/tick/route.test.ts` drive the real route handlers with real `Request` objects, so the backlog window, the frame encoding, the connect order, the 401/503 split and the authorise-before-anything ordering are tested rather than assumed — still unit-level, integration-lite, and no substitute for a live deployment. What they do not cover is sustained multi-hour live behaviour, real Vercel Cron delivery, cross-instance journal convergence under genuine concurrency, RPC flakiness under load, and provider-side upload failures, none of which have been exercised at length.
 
 ---
 
@@ -656,9 +919,10 @@ Ordered roughly by how much they would matter in production.
 | Styling | Tailwind CSS v4 |
 | Filecoin | `@filoz/synapse-sdk` 1.2.1 — **viem-based, not ethers** — plus `@filoz/synapse-core` 0.8 for the PDPVerifier reads (`getDataSetSizes`, `getActivePiecesByCursor`) the SDK does not re-export |
 | Chain client | viem 2.56 |
-| Transport | Server-Sent Events (`/api/stream`), carrying `snapshot`, `decision`, `tx`, `log`, `totals` and `notices` events. No websocket, no client polling loop, except the STORED DATA panel which polls `/api/storage` every 30s. |
-| Persistence | Append-only JSON Lines on disk (`src/lib/journal.ts`), one file per adapter mode. No database. |
-| Tests | Vitest 4, 239 tests across 10 files |
+| Transport | Server-Sent Events (`/api/stream`), carrying `snapshot`, `decision`, `tx`, `log`, `totals` and `notices` events. No websocket. Locally there is no client polling loop except the STORED DATA panel, which polls `/api/storage` every 30s; on the deployment the dashboard also re-reads `/api/snapshot` and `/api/decisions` every 5s, because the tick and the stream live in different Function instances. |
+| Persistence | Append-only JSON Lines, one stream per adapter mode. On disk locally (`src/lib/journal.ts`); as append-only segment objects in **Vercel Blob** (`@vercel/blob` 2.8, `src/lib/blobJournal.ts`) on Vercel, through the same parser. No database. |
+| Deployment | Vercel. Project config in `vercel.ts`, type-checked against **`@vercel/config`** 0.7 — `vercel.ts` rather than `vercel.json` because it can read the environment, so the cron schedule is a deployment setting rather than a constant baked into a committed file. Cycle driven by a Vercel Cron Job hitting `GET /api/tick`; `maxDuration` 300s on the tick and stream routes. |
+| Tests | Vitest 4, 332 tests across 17 files |
 | Network | Filecoin Calibration, chain ID 314159, 30s epochs, 2880 epochs/day |
 | Explorer | Filfox, `https://calibration.filfox.info/en/message/<hash>` |
 
@@ -679,6 +943,16 @@ A note on the SDK version, because most code samples online are stale: 1.2.1 rem
 | `src/lib/agent.test.ts` | 23 tests driving `runTick()` against a scripted adapter — failed reads, reverting deposits, unconfirmed transactions, concurrent ticks. |
 | `src/lib/journal.ts` | The durable append-only decision journal. The evidence file. Per-mode paths, mode-scoped reads. |
 | `src/lib/journalReport.ts` | Reader-side mode policy: `--mode` parsing, what counts as evidence, what a scope is hiding. Pure, 21 tests. |
+| `src/lib/blobJournal.ts` | The same append-only journal on Vercel Blob: per-writer segments, sealed at 50 lines, no shared-object read-modify-write. Also `readBlobJournal()`, which is what `npm run decisions -- --remote` reads, and `selectJournal()`, which picks disk or Blob. |
+| `src/lib/blobJournal.test.ts` | 17 tests against an injected IO fake — segmenting, sealing, re-read avoidance, mode scoping, selection, and the remote reader. No network, no token. |
+| `src/lib/deployment.ts` | Where this process is running and what that changes: the `interval` / `cron` driver, the real tick interval, whether a RUN TICK button may exist, whether the dashboard must poll. |
+| `src/lib/deployment.test.ts` | 12 tests pinning the driver decision, including that a typo in the override is ignored rather than trusted. |
+| `src/lib/tickAuth.ts` | The shared-secret check on `/api/tick`. Constant time, fail-closed, identical rejection text whatever went wrong. |
+| `src/lib/tickAuth.test.ts` | 19 tests: both header forms, the 401/503 split, and that no rejection leaks whether a secret is configured. |
+| `src/lib/spendGuard.ts` | The agent's own rolling 24h deposit cap. Pure; the caller supplies history, clock and limits. |
+| `src/lib/spendGuard.test.ts` | 20 tests over window arithmetic, both limits, the refusal wording and the EXECUTED-only accounting. |
+| `src/lib/agentSpendCap.test.ts` | 10 tests driving the cap end-to-end through `runTick()`: a capped tick journals a `SAFETY_CAP` decision and submits nothing. |
+| `src/lib/agentSnapshot.test.ts` | 6 tests on the TTL-gated snapshot read the cron driver uses, including that a failed read falls back to the last true reading rather than a fabricated one. |
 | `src/lib/chain/index.ts` | `ChainAdapter` interface (including `listStorage()`) and adapter selection. |
 | `src/lib/chain/synapse.ts` | Live Calibration adapter. One of two files that see the key. |
 | `src/lib/chain/mock.ts` | Accelerated simulation for keyless demos. |
@@ -688,8 +962,10 @@ A note on the SDK version, because most code samples online are stale: 1.2.1 rem
 | `src/app/page.tsx` | Server-rendered per request via `connection()`, so the mode badge is right on first paint. |
 | `src/app/api/*` | `snapshot`, `decisions`, `tick`, `stream`, `storage`. |
 | `src/app/api/stream/route.test.ts` | 9 tests driving the real route handler with a real `Request`, so the backlog window, the frame encoding and the connect order are under test rather than assumed. |
+| `src/app/api/tick/route.test.ts` | 9 tests on the one endpoint that can spend: 401 without the secret, 503 when none is configured, 200 for both verbs with it, and that authorisation happens before anything else can run. |
+| `vercel.ts` | Vercel project config: the cron schedule (env-driven, read at build time) and `maxDuration` on the tick and stream routes. Type-checked against `@vercel/config`. |
 | `src/components/*` | `RunwayGauge`, `StatTile`, `DecisionFeed`, `StoragePanel`, `StatusStrip`, `Dashboard`. |
 | `scripts/bootstrap.ts` | Operator CLI. The other file that sees the key. |
-| `scripts/decisions.ts` | Decision-log reader, plus `--split`. Needs no key, no RPC, no server. |
+| `scripts/decisions.ts` | Decision-log reader, plus `--split` and `--remote`. Needs no key and no server; `--remote` reads the deployed Blob journal instead of the local files. |
 | `docs/DEMO_SCRIPT.md` | Shot-by-shot video script. |
 | `docs/SHOWCASE.md` | Submission blurb and X thread. |

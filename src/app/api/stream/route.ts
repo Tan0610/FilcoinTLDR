@@ -1,9 +1,14 @@
-import { ensureAgentLoop } from "@/lib/agent";
+import { ensureAgentReady } from "@/lib/agent";
 import { SSE_HEARTBEAT_MS } from "@/lib/constants";
 import { getStore } from "@/lib/store";
 import type { AgentEvent } from "@/lib/types";
 
 export const runtime = "nodejs";
+/**
+ * Never prerendered: every response here is a live reading of the agent's own
+ * state, and a build-time snapshot served from a cache would be a false one.
+ */
+export const dynamic = "force-dynamic";
 
 /**
  * Server-Sent Events feed of every AgentEvent.
@@ -25,7 +30,7 @@ export const runtime = "nodejs";
  * older `notices` event that happens to still be in the tail.
  */
 export async function GET(request: Request) {
-  ensureAgentLoop();
+  await ensureAgentReady();
 
   const store = getStore();
   const encoder = new TextEncoder();

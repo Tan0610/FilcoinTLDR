@@ -43,6 +43,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import { EPOCHS_PER_DAY, explorerMessageUrl, isUnboundedEpochs } from "../src/lib/constants";
+import { blobPrefix, readBlobJournal } from "../src/lib/blobJournal";
 import {
   JOURNAL_VERSION,
   journalMode,
@@ -181,6 +182,8 @@ FilRunway decision log reader.
   npm run decisions -- --executed    only decisions that moved money
   npm run decisions -- --id <id>     one decision in full (searches every mode)
   npm run decisions -- --json        raw {mode, decision} records
+  npm run decisions -- --remote      read the DEPLOYED agent's journal out of
+                                     Vercel Blob instead of the local files
   npm run decisions -- --split       copy MOCK records out of the LIVE journal
                                      into the MOCK one (add --write to apply)
 
@@ -190,6 +193,10 @@ and is on no chain.
 
 Reads FILRUNWAY_DECISION_LOG when set, otherwise data/decisions.jsonl (LIVE)
 and data/decisions.mock.jsonl (MOCK). No key required.
+
+--remote reads the deployed agent's journal out of Vercel Blob instead. It needs
+BLOB_READ_WRITE_TOKEN in .env.local (\`vercel env pull .env.local\`), and still
+needs no private key and no running server.
 `;
 
 /** The value that follows a flag, or undefined when the flag is absent. */
@@ -301,7 +308,7 @@ function split(apply: boolean): number {
   return 0;
 }
 
-function main(): void {
+async function main(): Promise<void> {
   loadEnv();
 
   const args = process.argv.slice(2);
@@ -324,7 +331,14 @@ function main(): void {
   }
   const arg: ModeArg = parsed.scope;
 
-  const paths = journalPaths();
+  // `--remote` reads the DEPLOYED agent's journal out of Vercel Blob instead of
+  // the local files. Same parser, same records, same mode scoping — the only
+  // difference is where the bytes came from. It needs BLOB_READ_WRITE_TOKEN,
+  // which `vercel env pull .env.local` writes and `loadEnv()` has already read;
+  // it still needs no private key and no running server.
+  const remote = args.includes("--remote");
+
+  const paths = remote ? [`blob:${blobPrefix()}/`] : journalPaths();
   if (paths.length === 0) {
     console.error(
       "\nDecision persistence is off (FILRUNWAY_DECISION_LOG=off), so there is no log to read.\n",
@@ -333,16 +347,20 @@ function main(): void {
     return;
   }
 
-  // Both files, always, unscoped: the scope decides what is SHOWN, not what is
+  // Everything, always, unscoped: the scope decides what is SHOWN, not what is
   // opened, so `--mode mock` still finds MOCK records living in the LIVE file
   // and `--id` can find any record at all.
-  const all = readJournalFiles(paths, null);
+  const all = remote ? await readBlobJournal(null) : readJournalFiles(paths, null);
   for (const failure of all.errors) {
     console.error(`${YELLOW}Could not read ${failure.path}: ${failure.error}${RESET}`);
   }
   if (all.read === 0 && all.skipped === 0) {
     console.log(`\n${DIM}No decisions recorded yet at ${paths.join(" or ")}.${RESET}`);
-    console.log(`${DIM}Start the server (npm run dev) and let the agent tick.${RESET}\n`);
+    console.log(
+      remote
+        ? `${DIM}Deploy, let the cron job tick, then read again.${RESET}\n`
+        : `${DIM}Start the server (npm run dev) and let the agent tick.${RESET}\n`,
+    );
     return;
   }
 
@@ -480,4 +498,4 @@ function main(): void {
   console.log();
 }
 
-main();
+void main();

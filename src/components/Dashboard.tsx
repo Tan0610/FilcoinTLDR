@@ -64,9 +64,27 @@ export interface DashboardProps {
    * `/api/snapshot` resolves. See `StatusStrip`.
    */
   initialMode?: AgentMode;
+  /**
+   * Whether this build offers a RUN TICK button. False on a deployment, where
+   * `/api/tick` requires a secret the browser must never be given. Resolved on
+   * the server so the button is absent from the first painted frame rather
+   * than appearing and then being taken away.
+   */
+  manualTick?: boolean;
+  /**
+   * How often to re-read `/api/snapshot` and `/api/decisions`, in ms. 0 (the
+   * local default) means never: the SSE stream is served by the same process
+   * that runs the agent, so it already carries everything.
+   *
+   * Non-zero under the cron driver, where it is not. There the tick runs in one
+   * Function instance and this page's stream is held by another; both share the
+   * durable journal, so the page polls endpoints that read it. Merged, never
+   * replaced — see `src/lib/decisions.ts` for why that distinction matters.
+   */
+  pollMs?: number;
 }
 
-export function Dashboard({ initialMode }: DashboardProps = {}) {
+export function Dashboard({ initialMode, manualTick = true, pollMs = 0 }: DashboardProps = {}) {
   const [snapshot, setSnapshot] = useState<RunwaySnapshot | null>(null);
   const [status, setStatus] = useState<AgentStatus | null>(null);
   /**
@@ -137,38 +155,58 @@ export function Dashboard({ initialMode }: DashboardProps = {}) {
     setLastTickAt((prev) => mergeLastTickAt(prev, decision.at));
   }, []);
 
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  /**
+   * Read the server's own view of the agent and fold it in.
+   *
+   * Used for the initial hydrate and, under the cron driver, for the poll. It
+   * is the same operation in both cases, and it is safe to repeat because every
+   * write below MERGES: `mergeDecisions` keeps the more advanced record of any
+   * pair, `newerTotals` / `newerNotices` / `mergeLastTickAt` refuse to move
+   * backwards. So a response that raced the stream and lost cannot undo it.
+   */
+  const readServer = useCallback(async () => {
+    const [snapRes, decRes] = await Promise.all([
+      fetch("/api/snapshot", { cache: "no-store" }),
+      fetch("/api/decisions?limit=60", { cache: "no-store" }),
+    ]);
+    const snap = (await snapRes.json()) as SnapshotResponse;
+    const dec = (await decRes.json()) as DecisionsResponse;
+    if (!mounted.current) return;
+    setStatus(snap.status);
+    setTotals((prev) => newerTotals(prev, dec.status.totals));
+    setNotices((prev) => newerNotices(prev, snap.status.notices));
+    applySnapshot(snap.snapshot);
+    // MERGE, never replace. This response is what starts the agent loop, so
+    // it usually arrives empty while the first tick is still running, and it
+    // is gated behind the (slow, in LIVE mode) snapshot read beside it — by
+    // which time the stream may already have delivered that first decision.
+    // See src/lib/decisions.ts.
+    setDecisions((prev) => mergeDecisions(prev, dec.decisions));
+    setLastTickAt((prev) => mergeLastTickAt(prev, dec.status.lastTickAt));
+  }, [applySnapshot]);
+
   /* ---- initial hydrate ---- */
   useEffect(() => {
-    let cancelled = false;
-
-    const load = async () => {
-      const [snapRes, decRes] = await Promise.all([
-        fetch("/api/snapshot", { cache: "no-store" }),
-        fetch("/api/decisions?limit=60", { cache: "no-store" }),
-      ]);
-      const snap = (await snapRes.json()) as SnapshotResponse;
-      const dec = (await decRes.json()) as DecisionsResponse;
-      if (cancelled) return;
-      setStatus(snap.status);
-      setTotals((prev) => newerTotals(prev, dec.status.totals));
-      setNotices((prev) => newerNotices(prev, snap.status.notices));
-      applySnapshot(snap.snapshot);
-      // MERGE, never replace. This response is what starts the agent loop, so
-      // it usually arrives empty while the first tick is still running, and it
-      // is gated behind the (slow, in LIVE mode) snapshot read beside it — by
-      // which time the stream may already have delivered that first decision.
-      // See src/lib/decisions.ts.
-      setDecisions((prev) => mergeDecisions(prev, dec.decisions));
-      setLastTickAt((prev) => mergeLastTickAt(prev, dec.status.lastTickAt));
-    };
-
     // If this fails the SSE stream will fill everything in shortly.
-    void load().catch(() => undefined);
+    void readServer().catch(() => undefined);
+  }, [readServer]);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [applySnapshot]);
+  /* ---- poll, only where the stream is not authoritative ---- */
+  useEffect(() => {
+    if (pollMs <= 0) return;
+    const timer = window.setInterval(() => {
+      void readServer().catch(() => undefined);
+    }, pollMs);
+    return () => window.clearInterval(timer);
+  }, [pollMs, readServer]);
 
   /* ---- live event stream ---- */
   useEffect(() => {
@@ -292,6 +330,7 @@ export function Dashboard({ initialMode }: DashboardProps = {}) {
         now={now}
         lastTickAt={lastTickAt}
         ticking={ticking}
+        manualTick={manualTick}
         onTick={() => void onTick()}
       />
 

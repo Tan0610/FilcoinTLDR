@@ -22,7 +22,15 @@
 import { getChainAdapter } from "./chain";
 import { SENSE_INTERVAL_MS, TICK_INTERVAL_MS, explorerMessageUrl } from "./constants";
 import { DEMO_LABEL, DEMO_SCALED, DEMO_SCALE_AGREEMENT, scaleRules } from "./demo";
+import { agentDriver, tickIntervalMs } from "./deployment";
 import { DEFAULT_RULES, evaluate, newDecisionId } from "./policy";
+import {
+  checkSpend,
+  describeLimits,
+  spendCapEnabled,
+  spendLimits,
+  type SpendLimits,
+} from "./spendGuard";
 import { getStore } from "./store";
 import type {
   AgentStatus,
@@ -58,6 +66,39 @@ function notice(key: string, level: LogLevel, message: string): void {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The agent's own spending cap, applied to a decision that wants to deposit.
+ *
+ * Runs BEFORE the decision is recorded, so a capped tick is journalled once, as
+ * what it is, rather than as a TOP_UP that quietly turned into something else.
+ * The rule that fired is kept on the decision and its reasoning is kept in
+ * front of the refusal: the record has to show what the agent wanted to do as
+ * well as why it did not.
+ *
+ * This is the only place the cap is enforced, and it is deliberately outside
+ * `policy.ts` — `evaluate()` is pure, and answering "how much have I spent in
+ * the last 24 hours?" needs the durable history that only the store has.
+ *
+ * Limits are read per call rather than captured at module load, so changing
+ * them is an environment change and not a redeploy of a frozen constant.
+ */
+function applySpendCap(decision: Decision): Decision {
+  if (decision.action !== "TOP_UP" && decision.action !== "EMERGENCY_TOP_UP") return decision;
+  if (!spendCapEnabled(getChainAdapter().mode)) return decision;
+
+  const limits: SpendLimits = spendLimits();
+  const amount = decision.ruleFired?.topUpAmount ?? "0";
+  const verdict = checkSpend(getStore().spendEntries(), amount, decision.at, limits);
+  if (verdict.allowed) return decision;
+
+  return {
+    ...decision,
+    action: "SAFETY_CAP",
+    outcome: "NO_ACTION",
+    reasoning: `${decision.reasoning} ${verdict.reason}`,
+  };
 }
 
 /** Stand-in reading for a FAILED decision taken before any successful read. */
@@ -100,12 +141,17 @@ export async function getStorage(): Promise<StorageListing> {
 export async function getStatus(): Promise<AgentStatus> {
   const store = getStore();
   const adapter = getChainAdapter();
+  // The interval ACTUALLY in force. Under the cron driver the local 15s
+  // constant is not what schedules anything, and a NEXT TICK countdown running
+  // to a deadline nothing observes would be a false reading on a dashboard
+  // whose whole claim is that its readings are true.
+  const interval = tickIntervalMs(TICK_INTERVAL_MS);
   return {
     mode: adapter.mode,
     address: await adapter.getAddress(),
-    tickIntervalMs: TICK_INTERVAL_MS,
+    tickIntervalMs: interval,
     lastTickAt: store.lastTickAt,
-    nextTickAt: store.lastTickAt === null ? null : store.lastTickAt + TICK_INTERVAL_MS,
+    nextTickAt: store.lastTickAt === null ? null : store.lastTickAt + interval,
     // Whole-history figures, from the durable journal rather than from whatever
     // decisions a particular browser tab happens to be holding.
     totals: store.totals,
@@ -130,9 +176,43 @@ export async function sense(): Promise<RunwaySnapshot> {
   return snapshot;
 }
 
+/**
+ * How stale a reading may be before `getSnapshot()` takes a new one, under the
+ * cron driver only.
+ *
+ * Locally a `setInterval` re-reads the chain every 2 seconds, which is what
+ * gives the gauge enough anchor points to count down smoothly. A serverless
+ * instance has no such timer, so without this the dashboard would show one
+ * reading per minute and the needle would sit still between ticks — a true
+ * number, but a static one, on a page whose entire point is watching a live
+ * position move.
+ *
+ * Deliberately far LONGER than the local 2s: this read is reachable from a
+ * public GET, so it is a shared, TTL-gated cache per instance rather than a
+ * read per request. It is a READ, never a decision — nothing here can spend.
+ */
+const REMOTE_SENSE_TTL_MS = 10_000;
+
+/** Coalesces concurrent refreshes so several polling tabs cost one chain read. */
+let senseInFlight: Promise<RunwaySnapshot> | null = null;
+
 export async function getSnapshot(): Promise<RunwaySnapshot> {
   const store = getStore();
-  return store.snapshot ?? (await sense());
+  const snapshot = store.snapshot;
+  if (!snapshot) return sense();
+
+  if (agentDriver() !== "cron" || Date.now() - snapshot.takenAt <= REMOTE_SENSE_TTL_MS) {
+    return snapshot;
+  }
+
+  senseInFlight ??= sense()
+    // A failed read falls back to the last true reading rather than to a
+    // fabricated one or a 500. The dashboard already marks the stream stale.
+    .catch(() => snapshot)
+    .finally(() => {
+      senseInFlight = null;
+    });
+  return senseInFlight;
 }
 
 /** What a tick call returns. See `runTick()` for why `coalesced` exists. */
@@ -188,7 +268,13 @@ export async function runTick(): Promise<TickResult> {
   });
   store.inFlightTick = running;
 
-  return { decision: await running, coalesced: false };
+  const decision = await running;
+  // Do not return until the record is actually durable. On a serverless host
+  // the instance can be frozen the instant the handler responds, and a journal
+  // write still queued at that moment is a transaction with no evidence behind
+  // it — the exact failure this project's autonomy claim cannot survive.
+  await store.flushJournal();
+  return { decision, coalesced: false };
 }
 
 /** The cycle itself. Only ever called through `runTick`'s guard. */
@@ -226,6 +312,7 @@ async function executeTick(): Promise<Decision> {
   }
 
   let decision = evaluate(snapshot, ACTIVE_RULES);
+  decision = applySpendCap(decision);
 
   store.upsertDecision(decision);
   store.markTick(decision.at);
@@ -235,6 +322,13 @@ async function executeTick(): Promise<Decision> {
     type: "decision",
     decision,
   });
+
+  if (decision.action === "SAFETY_CAP") {
+    // Declined by the agent itself. Nothing was submitted and nothing may be:
+    // this is the decision, not a step on the way to one.
+    log("warn", decision.reasoning);
+    return decision;
+  }
 
   if (decision.action === "INSUFFICIENT_FUNDS") {
     // The policy engine already established the wallet cannot cover this
@@ -273,6 +367,10 @@ async function executeTick(): Promise<Decision> {
     });
 
     decision = { ...decision, outcome: "EXECUTED", txHash };
+    // Count it against the cap the moment it reaches the chain, not when the
+    // journal is next read: a burst of ticks inside one process must not be
+    // able to outrun the cap simply by being faster than persistence.
+    store.recordSpend({ id: decision.id, at: decision.at, amountUsdfc: amount });
     log(
       "info",
       tracksConfirmation
@@ -304,6 +402,9 @@ async function executeTick(): Promise<Decision> {
       if (result.status === "FAILED") {
         const message = result.error ?? "Transaction failed to confirm";
         decision = { ...decision, outcome: "FAILED", error: message };
+        // It did not stand, so it does not count. Keeps the cap's arithmetic
+        // identical to the journal's, which counts EXECUTED decisions only.
+        store.releaseSpend(decision.id);
         log("error", `Deposit of ${amount} USDFC did not confirm: ${message}`);
       } else {
         log("info", `Deposit confirmed onchain: ${amount} USDFC.`);
@@ -329,16 +430,62 @@ async function executeTick(): Promise<Decision> {
 }
 
 /**
+ * Prepare this process to answer a request about the agent.
+ *
+ * Two things, in order, and every route calls it in place of
+ * `ensureAgentLoop()`:
+ *
+ *   1. Start the loop (or, under the cron driver, announce that there is not
+ *      one) — unchanged behaviour, still idempotent.
+ *   2. Make sure the durable record has actually been read, and re-read it if
+ *      another process has written since.
+ *
+ * Locally both steps are free: the filesystem journal was read inside the
+ * store's constructor, `ready` is already resolved and `refresh()` returns
+ * immediately. Deployed, this is what turns five independent Function
+ * instances into one agent with one history.
+ */
+export async function ensureAgentReady(): Promise<void> {
+  ensureAgentLoop();
+  const store = getStore();
+  await store.ready;
+  await store.refresh();
+}
+
+/**
  * Start the autonomous loop. Called lazily from the API routes so nothing
  * schedules timers during `next build`. Idempotent, and safe across hot reloads
  * because the guard lives on the globalThis-pinned store.
+ *
+ * THE DRIVER
+ * ----------
+ * Under the `interval` driver this is exactly what it always was: two timers
+ * and an immediate first tick, owned by a process that stays alive.
+ *
+ * Under the `cron` driver it starts NOTHING. A Vercel Function exists for the
+ * length of a request, so a timer set here would either never fire or fire
+ * unobserved — and, worse, the immediate `runTick()` would mean that merely
+ * READING the dashboard could cause the agent to spend. The cycle is driven
+ * from outside instead, by a scheduled, authenticated call to `/api/tick`.
+ * See `src/lib/deployment.ts` and `vercel.ts`.
  */
 export function ensureAgentLoop(): void {
   const store = getStore();
   if (store.loopStarted) return;
   store.loopStarted = true;
 
+  const driver = agentDriver();
+  const interval = tickIntervalMs(TICK_INTERVAL_MS);
+
   log("info", `FilRunway agent online (${getChainAdapter().mode} mode).`);
+  if (spendCapEnabled(getChainAdapter().mode)) {
+    // Pinned, because it qualifies every deposit figure on the dashboard for as
+    // long as the process runs, and because a viewer who arrives after a
+    // SAFETY_CAP card needs to be able to see what limit it was that fired.
+    // Raised only when the cap is actually in force — a MOCK run states nothing,
+    // since claiming a limit that is not enforced would be worse than silence.
+    notice("spend-cap", "info", describeLimits(spendLimits()));
+  }
   if (store.journal.enabled) {
     // Where the record lives is already permanent on screen: `journalPath` on
     // AgentStatus backs the deposits tile's own "durable record" wording.
@@ -375,6 +522,21 @@ export function ensureAgentLoop(): void {
         `browser gauge will draw ×${DEMO_SCALE_AGREEMENT.client}. Set ` +
         "NEXT_PUBLIC_FILRUNWAY_DEMO_SCALE (not just FILRUNWAY_DEMO_SCALE) so both agree.",
     );
+  }
+
+  if (driver === "cron") {
+    // Pinned, not logged: a viewer arriving an hour in must still be able to
+    // tell what is driving this agent. It is also the answer to "why is there
+    // no RUN TICK button?", which is otherwise a silent difference from the
+    // local build.
+    notice(
+      "driver-cron",
+      "info",
+      `Serverless deployment: the agent is driven by a scheduled call to /api/tick every ` +
+        `${Math.round(interval / 1000)}s, not by a timer in this process. /api/tick requires ` +
+        "the deployment's shared secret, so no visitor can make this agent spend.",
+    );
+    return;
   }
 
   setInterval(() => {

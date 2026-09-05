@@ -49,21 +49,55 @@ function HoldCard({ decision }: { decision: Decision }) {
 }
 
 /**
- * The agent wanted to act and cannot afford to. Not a resting state like HOLD
- * and not an executed action like TOP_UP — so it gets its own treatment: a
- * heavy solid rail, a red wash, an inverted header bar and an explicit
- * operator-action footer. Nothing was submitted; there is no tx row.
+ * The two ways the agent DECLINES, and how each is dressed.
+ *
+ * They share a card because they are the same kind of event — a rule fired, the
+ * agent recognised a constraint, and nothing was submitted — but they must not
+ * look identical, because one needs a human and the other does not:
+ *
+ *   - INSUFFICIENT_FUNDS is red and asks for an operator. The agent is stuck
+ *     until someone funds the wallet.
+ *   - SAFETY_CAP is amber and asks for nobody. The agent applied a limit it was
+ *     given, on purpose, and will resume of its own accord when the window
+ *     rolls. Painting that in alarm-red would misreport a working safety
+ *     feature as a fault.
+ */
+const DECLINE_STYLE = {
+  INSUFFICIENT_FUNDS: {
+    color: ACTION_VAR.INSUFFICIENT_FUNDS,
+    wash: "rgba(255, 77, 99, 0.08)",
+    pill: "BLOCKED",
+    footer:
+      "Operator action required — fund the agent wallet. No transaction was attempted.",
+  },
+  SAFETY_CAP: {
+    color: ACTION_VAR.SAFETY_CAP,
+    wash: "rgba(255, 182, 46, 0.08)",
+    pill: "CAPPED",
+    footer:
+      "Self-imposed limit — the agent declined to spend and will resume when the window " +
+      "rolls. No operator action required, and no transaction was attempted.",
+  },
+} as const;
+
+type DeclineAction = keyof typeof DECLINE_STYLE;
+
+/**
+ * The agent wanted to act and did not. Not a resting state like HOLD and not an
+ * executed action like TOP_UP — so it gets its own treatment: a heavy solid
+ * rail, a wash, an inverted header bar and an explicit footer saying what
+ * happens next. Nothing was submitted; there is no tx row.
  */
 function BlockedCard({ decision }: { decision: Decision }) {
-  const color = ACTION_VAR.INSUFFICIENT_FUNDS;
+  const style = DECLINE_STYLE[decision.action as DeclineAction] ?? DECLINE_STYLE.INSUFFICIENT_FUNDS;
+  const color = style.color;
 
   return (
     <li
       className="enter border-2"
       style={{
         borderColor: color,
-        background:
-          "linear-gradient(rgba(255, 77, 99, 0.08), rgba(255, 77, 99, 0.08)), var(--panel-2)",
+        background: `linear-gradient(${style.wash}, ${style.wash}), var(--panel-2)`,
       }}
     >
       <div
@@ -85,7 +119,7 @@ function BlockedCard({ decision }: { decision: Decision }) {
             className="border px-2 py-0.5 text-[10px] font-bold tracking-[0.16em]"
             style={{ borderColor: "#05070c" }}
           >
-            BLOCKED
+            {style.pill}
           </span>
         </span>
       </div>
@@ -98,8 +132,7 @@ function BlockedCard({ decision }: { decision: Decision }) {
         className="border-t px-4 py-2 font-sans text-[12px]"
         style={{ borderColor: color, color }}
       >
-        Operator action required &mdash; fund the agent wallet. No transaction was
-        attempted.
+        {style.footer}
       </div>
     </li>
   );
@@ -281,7 +314,12 @@ export const DecisionFeed = memo(function DecisionFeed({
               if (decision.action === "HOLD") {
                 return <HoldCard key={decision.id} decision={decision} />;
               }
-              if (decision.action === "INSUFFICIENT_FUNDS") {
+              // Both declining paths: a rule fired and nothing was submitted.
+              // `BlockedCard` tells them apart — see `DECLINE_STYLE`.
+              if (
+                decision.action === "INSUFFICIENT_FUNDS" ||
+                decision.action === "SAFETY_CAP"
+              ) {
                 return <BlockedCard key={decision.id} decision={decision} />;
               }
               return <ActionCard key={decision.id} decision={decision} />;

@@ -1,7 +1,12 @@
-import { ensureAgentLoop, getStatus, getStorage } from "@/lib/agent";
+import { ensureAgentReady, getStatus, getStorage } from "@/lib/agent";
 import type { ApiError, StorageResponse } from "@/lib/types";
 
 export const runtime = "nodejs";
+/**
+ * Never prerendered: every response here is a live reading of the agent's own
+ * state, and a build-time snapshot served from a cache would be a false one.
+ */
+export const dynamic = "force-dynamic";
 
 /**
  * What the agent is paying to store: data sets, providers, sizes, piece CIDs.
@@ -12,7 +17,7 @@ export const runtime = "nodejs";
  * of its rows rather than substituting invented ones.
  */
 export async function GET() {
-  ensureAgentLoop();
+  await ensureAgentReady();
   try {
     const [storage, status] = await Promise.all([getStorage(), getStatus()]);
     const body: StorageResponse = { storage, status };

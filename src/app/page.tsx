@@ -2,6 +2,7 @@ import { connection } from "next/server";
 
 import { Dashboard } from "@/components/Dashboard";
 import { getChainMode } from "@/lib/chain";
+import { dashboardPollMs, manualTickEnabled } from "@/lib/deployment";
 
 /**
  * The mode badge must be right on the FIRST painted frame.
@@ -21,8 +22,27 @@ import { getChainMode } from "@/lib/chain";
  * removed once Cache Components is enabled, and this must not quietly become a
  * no-op if that flag is ever turned on. The page is one component, so
  * rendering it per request costs nothing worth measuring.
+ *
+ * The same request-time read decides two deployment-shaped things, for the same
+ * reason — the answer is in the environment, and it must be the SERVER's
+ * answer:
+ *
+ *   - `manualTick`: whether to offer a RUN TICK button at all. On a public
+ *     deployment `/api/tick` needs a shared secret, and the only way a browser
+ *     button could send one is if the secret were in the page. It is not, so
+ *     the button is not either. See `src/lib/deployment.ts`.
+ *   - `pollMs`: whether the dashboard must poll. Locally the SSE stream comes
+ *     from the very process running the agent and is authoritative. Under the
+ *     cron driver it is not — the tick ran in a different Function instance —
+ *     so the page also re-reads the shared journal.
  */
 export default async function Home() {
   await connection();
-  return <Dashboard initialMode={getChainMode() === "live" ? "LIVE" : "MOCK"} />;
+  return (
+    <Dashboard
+      initialMode={getChainMode() === "live" ? "LIVE" : "MOCK"}
+      manualTick={manualTickEnabled()}
+      pollMs={dashboardPollMs()}
+    />
+  );
 }

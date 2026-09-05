@@ -46,12 +46,20 @@ export type PolicyAction = "TOP_UP" | "EMERGENCY_TOP_UP" | "HOLD";
 /**
  * What the agent actually decided — a superset of `PolicyAction`.
  *
- * A rule can only ask for TOP_UP / EMERGENCY_TOP_UP / HOLD. The policy engine
- * can additionally conclude INSUFFICIENT_FUNDS: the rule fired, but the wallet
- * cannot cover the deposit it calls for, so nothing is attempted. That is a
- * deliberate decision (outcome NO_ACTION), never a failed transaction.
+ * A rule can only ask for TOP_UP / EMERGENCY_TOP_UP / HOLD. Two further
+ * conclusions are the agent's own, and both DECLINE to transact with a stated
+ * reason rather than failing:
+ *
+ *   - INSUFFICIENT_FUNDS — the rule fired and the wallet cannot cover the
+ *     deposit it calls for, so nothing is attempted.
+ *   - SAFETY_CAP — the rule fired and the wallet could cover it, but the agent
+ *     has already made as many (or as large) deposits as its own rolling
+ *     24-hour limit allows. See `src/lib/spendGuard.ts`.
+ *
+ * Both carry outcome NO_ACTION. Neither is a failed transaction: recognising a
+ * constraint and saying so is a decision, and it is recorded as one.
  */
-export type DecisionAction = PolicyAction | "INSUFFICIENT_FUNDS";
+export type DecisionAction = PolicyAction | "INSUFFICIENT_FUNDS" | "SAFETY_CAP";
 
 /**
  * One line of the agent's policy. Rules are evaluated lowest-threshold-first;

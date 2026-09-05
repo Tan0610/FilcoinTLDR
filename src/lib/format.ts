@@ -49,6 +49,10 @@ export const ACTION_VAR: Record<DecisionAction, string> = {
   TOP_UP: "var(--warn)",
   EMERGENCY_TOP_UP: "var(--crit)",
   INSUFFICIENT_FUNDS: "var(--crit)",
+  // Amber, not red. INSUFFICIENT_FUNDS needs an operator; a safety cap needs
+  // nobody — the agent applied a limit it was given and will resume by itself.
+  // Colouring the two the same would read as two alarms.
+  SAFETY_CAP: "var(--warn)",
 };
 
 export const ACTION_LABEL: Record<DecisionAction, string> = {
@@ -56,6 +60,7 @@ export const ACTION_LABEL: Record<DecisionAction, string> = {
   TOP_UP: "TOP UP",
   EMERGENCY_TOP_UP: "EMERGENCY TOP UP",
   INSUFFICIENT_FUNDS: "INSUFFICIENT FUNDS",
+  SAFETY_CAP: "SAFETY CAP",
 };
 
 /** 0x1234abcd...ef01 */
