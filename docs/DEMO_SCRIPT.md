@@ -78,7 +78,7 @@ Choosing the scale is arithmetic, not tuning. Take your real runway `R` from `bo
 18. Editor open on `src/lib/policy.ts`, scrolled so lines 119 to 135 are on screen (`evaluate()` through the rule branch).
 19. **Do not touch `RUN TICK NOW` during the decision beat.** The point is that nobody pressed anything. Keep the cursor away from that button and let the countdown reach zero on its own.
 
-    If you are recording the **deployment**, there is no such button to avoid: the deployed build shows a dashed `CRON DRIVEN` chip in its place, because `/api/tick` requires a secret the page must never carry. That is worth one sentence of narration rather than passing over it — it is a stronger version of the same claim. Nobody watching the page can make this agent act, and nobody has to be watching for it to act, because the loop does not start on a page view at all.
+    If you are recording the **deployment**, the button is there but inert: `/api/tick` requires the deployment's shared secret, and the page only carries it if a human pastes it in. Leave the secret field empty for the decision beat and the control cannot fire. That is worth one sentence of narration rather than passing over it — it is a stronger version of the same claim. Nobody watching the page can make this agent act, and nobody has to be watching for it to act, because the loop does not start on a page view at all.
 
 ---
 
