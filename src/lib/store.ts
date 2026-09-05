@@ -28,6 +28,7 @@
  */
 
 import { selectJournal } from "./blobJournal";
+import { getChainAdapter } from "./chain";
 import { mergeDecisions } from "./decisions";
 import {
   emptyTotals,
@@ -41,12 +42,30 @@ import { spendEntriesFrom, type SpendEntry } from "./spendGuard";
 import { squeezeEntriesFrom, type SqueezeEntry } from "./squeezeGuard";
 import type {
   AgentEvent,
+  AgentMode,
   AgentNotice,
   Decision,
   DecisionTotals,
   LogLevel,
   RunwaySnapshot,
 } from "./types";
+
+/**
+ * The mode of the adapter that is actually in use, for the journal's stamp.
+ *
+ * NEVER THROWS, and falls back to MOCK. `getChainAdapter()` constructs the
+ * live adapter on first call and that constructor validates its key, so it can
+ * throw; a store that cannot find out which chain it is talking to has not
+ * thereby earned the right to call its records LIVE. Down is the safe way to
+ * be wrong — see `stampMode()` in `src/lib/journal.ts`.
+ */
+function adapterMode(): AgentMode {
+  try {
+    return getChainAdapter().mode;
+  } catch {
+    return "MOCK";
+  }
+}
 
 /** How many decisions the in-memory ring holds. Does NOT bound the journal. */
 export const MAX_DECISIONS = 200;
@@ -151,8 +170,16 @@ class AgentStore {
   /** So the failure is stated once, not once per decision, after it happens. */
   private journalFailureReported = false;
 
-  constructor(journal: DecisionJournal = selectJournal()) {
+  /**
+   * Which adapter is actually behind the decisions this store records. Read
+   * per append rather than once, because `setChainAdapter()` can swap it after
+   * the store exists. See `adapterMode()` and `stampMode()`.
+   */
+  private readonly sourceMode: () => AgentMode;
+
+  constructor(journal: DecisionJournal = selectJournal(), sourceMode: () => AgentMode = adapterMode) {
     this.journal = journal;
+    this.sourceMode = sourceMode;
   }
 
   /**
@@ -421,7 +448,9 @@ class AgentStore {
    */
   private appendToJournal(decision: Decision): void {
     if (!this.journal.enabled) return;
-    this.journal.append(decision);
+    // The adapter's own answer, never the environment's: a MOCK adapter's
+    // decision cannot be stamped LIVE however this process was configured.
+    this.journal.append(decision, this.sourceMode());
     this.checkJournalHealth();
   }
 
@@ -566,7 +595,7 @@ class AgentStore {
       amountUsdfc: squeeze.amountUsdfc,
     });
     if (!this.journal.enabled) return;
-    this.journal.appendSqueeze?.(squeeze);
+    this.journal.appendSqueeze?.(squeeze, this.sourceMode());
     this.checkJournalHealth();
   }
 
@@ -649,8 +678,8 @@ function announce(store: AgentStore, note: { level: LogLevel; message: string } 
  * becomes `store.ready` and the routes await it. The two paths are deliberately
  * separate: the local one must not acquire an await it never needed.
  */
-function createStore(journal?: DecisionJournal): AgentStore {
-  const store = new AgentStore(journal);
+function createStore(journal?: DecisionJournal, sourceMode?: () => AgentMode): AgentStore {
+  const store = new AgentStore(journal, sourceMode);
 
   if (store.journal.synchronous === false) {
     store.ready = store
@@ -676,9 +705,9 @@ export function getStore(): AgentStore {
  * Test/demo hook: replace the process-wide store, optionally with a journal of
  * your own. Pass `nullJournal()` to keep a test off the filesystem entirely.
  */
-export function resetStore(journal?: DecisionJournal): AgentStore {
+export function resetStore(journal?: DecisionJournal, sourceMode?: () => AgentMode): AgentStore {
   const g = globalThis as GlobalWithStore;
-  const store = createStore(journal);
+  const store = createStore(journal, sourceMode);
   g[STORE_KEY] = store;
   return store;
 }

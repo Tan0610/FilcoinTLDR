@@ -29,7 +29,7 @@ Every `path:line` citation here was checked against the tree at the time of writ
 
 **Read this before you believe any autonomy claim in this project.**
 
-An autonomous `TOP_UP` and an operator typing `npm run bootstrap -- fund 5` produce **byte-identical** transactions on Filecoin Pay. Nothing on chain records which one moved the money. A transaction hash on Filfox is therefore evidence that *something* deposited USDFC, and evidence of nothing else.
+An autonomous `TOP_UP` and an operator typing `npm run bootstrap -- fund 5` produce **byte-identical** transactions on Filecoin Pay. Nothing on chain records which one moved the money. A transaction hash on Blockscout is therefore evidence that *something* deposited USDFC, and evidence of nothing else.
 
 The only thing that separates the two is the `Decision` that preceded the agent's: the reading it was taken from, the rule that fired, the reasoning it wrote, and the tx hash it produced. Those decisions are appended to a durable, append-only JSON Lines file (`src/lib/journal.ts`), and `scripts/decisions.ts` reads it.
 
@@ -49,7 +49,7 @@ npm run decisions -- --split --write   # actually apply that copy
 
 `scripts/decisions.ts` needs **no private key and no running server**. In its default form it reads the local JSONL files and needs no network either. `--remote` points it at the deployed agent's Blob journal instead (`readBlobJournal()`, `src/lib/blobJournal.ts:684`) and needs only `BLOB_READ_WRITE_TOKEN`, which `vercel env pull .env.local` writes — still no private key, still no server. Every other flag behaves identically against either source, because both go through the same parser and the same mode scoping.
 
-The bare form ends with a `transactions the agent authored` block that pairs every tx hash with its Filfox URL, the id of the decision that authored it, and the exact command to expand that decision.
+The bare form ends with a `transactions the agent authored` block that pairs every tx hash with its Blockscout URL, the id of the decision that authored it, and the exact command to expand that decision.
 
 To line the headline transaction up against the decision that produced it:
 
@@ -58,7 +58,7 @@ npm run decisions -- --executed          # find the decision id next to the hash
 npm run decisions -- --id <that id>      # the full record: reading, rule, reasoning, hash
 ```
 
-The `--id` view prints the Filecoin Pay reading the agent was looking at (epoch, funds available, lockup rate, runway in epochs, wallet balances), the rule that fired with its threshold and amount, the reasoning string the agent generated from those numbers, the outcome, and the hash — which you then paste into Filfox. Hash matches, reading matches, and the record was written *before* the transaction existed.
+The `--id` view prints the Filecoin Pay reading the agent was looking at (epoch, funds available, lockup rate, runway in epochs, wallet balances), the rule that fired with its threshold and amount, the reasoning string the agent generated from those numbers, the outcome, and the hash — which you then paste into Blockscout. Hash matches, reading matches, and the record was written *before* the transaction existed.
 
 On the machine that ran the reference demo, the bare form reads (ANSI colour stripped):
 
@@ -82,11 +82,16 @@ most recent 20 of 1481
 
 transactions the agent authored (LIVE, onchain)
 -----------------------------------------------
+  re-checked against https://api.calibration.node.glif.io/rpc/v1 just now
+
   0x06e27a6a7fd532722727953b8d266f14d8109aaaa2c9edc8645bf17a1a2fcf6b
-  https://calibration.filfox.info/en/message/0x06e27a6a7fd532722727953b8d266f14d8109aaaa2c9edc8645bf17a1a2fcf6b
+  confirmed onchain · block 4,034,196
+  https://filecoin-testnet.blockscout.com/tx/0x06e27a6a7fd532722727953b8d266f14d8109aaaa2c9edc8645bf17a1a2fcf6b
   decision 1b2d98ef-4984-482f-b394-498ea99b29a6 · 2026-09-02 12:30:30 UTC
   npm run decisions -- --id 1b2d98ef-4984-482f-b394-498ea99b29a6
 ```
+
+The `confirmed onchain` line is a live `eth_getTransactionByHash` call made as the report is printed, not a value read out of the journal — the reader never presents a hash it could not confirm as though it had. On an older record the public endpoint may answer `UNCONFIRMED` instead; that is the endpoint's three-day hash index expiring, not a bad record, and §12.2 explains how to tell the two apart.
 
 The decision count keeps climbing (a fresh run will show more than 1,481, and a later timestamp) because the agent ticks every 15 seconds and a dev server was running while this was captured — the hash, the decision id and the `deposited 5 USDFC` total are what stay fixed.
 
@@ -1116,7 +1121,7 @@ Everything here is a real difference a viewer can notice. None of it is hidden b
 | Agent address | Real. Derived locally from `FILECOIN_PRIVATE_KEY` via viem, with no RPC, so the status strip survives a node outage. |
 | `runwayInEpochs`, `availableFunds`, `debt`, `lockupRatePerEpoch`, `totalLockup`, `epoch` | Real. `synapse.payments.accountSummary()` against Filecoin Pay on Calibration. |
 | Wallet tFIL and USDFC balances | Real. `synapse.payments.walletBalance({ token })`, both tokens named explicitly. |
-| Top-up transaction | Real. `synapse.payments.fund({ amount })`, submitted by the agent. The hash resolves on Filfox. |
+| Top-up transaction | Real. `synapse.payments.fund({ amount })`, submitted by the agent. The hash resolves on Blockscout. |
 | Transaction confirmation | Real. `client.waitForTransactionReceipt`; the tx event walks SUBMITTED to CONFIRMED or FAILED. |
 | Stored data | Real. `storage.prepare()` then `storage.upload()`, two copies through Warm Storage and PDP. |
 | The cost stream being managed | Real. It exists because real data sits under a real data set. |
@@ -1134,17 +1139,38 @@ Everything here is a real difference a viewer can notice. None of it is hidden b
 
 ### 12.2 The onchain evidence
 
-**The headline proof — cite this one.** The transaction the decision journal actually backs is [`0x06e27a6a…`](https://calibration.filfox.info/en/message/0x06e27a6a7fd532722727953b8d266f14d8109aaaa2c9edc8645bf17a1a2fcf6b) (status success, block 4,034,196, to the Filecoin Pay contract, 5 USDFC), paired with decision `1b2d98ef-4984-482f-b394-498ea99b29a6`. Run `npm run decisions -- --id 1b2d98ef-4984-482f-b394-498ea99b29a6` and it prints the reading, the rule that fired, the reasoning, and this exact hash — the one place where the proof command and the hash it names actually match, because it is the one hash the journal contains.
+Every transaction below was sent from the agent wallet **`0x48c54EAb7039f43DcAEd14ba44b999E16a9309bD`** to the Filecoin Pay contract `0x09a0fDc2723fAd1A7b8e3e00eE5DF73841df55a0`. Each was re-verified directly against a Calibration RPC node (`eth_getTransactionByHash` / `eth_getTransactionReceipt`) rather than transcribed from a document: the `from`, `to`, block height and the deposit amount decoded from the calldata all match what is stated here.
 
-There is also an earlier autonomous top-up, [`0x17f5ecd7…`](https://calibration.filfox.info/en/message/0x17f5ecd765fdef0078241ec1e5b76d4017c96305f7ee80b347bbd29f50d03ac3) (status success, block 4,033,951, 5 USDFC, to the Filecoin Pay contract). It is real — made during live verification — but it predates the decision journal: it is not a line in `data/decisions.jsonl`, no `npm run decisions -- --id` command can produce it, and it must not be cited as agent-authored on the strength of this project's own evidence mechanism. Corroborating history, not proof.
+| Transaction | Block | Amount | Selector | Journal-backed? |
+|---|---|---|---|---|
+| `0x85a8d620…`, on chain as [`0x400ce862…`](https://filecoin-testnet.blockscout.com/tx/0x400ce8628408da3d4c5b1e09ec7a2533f7e6da374a2a86f33f72a553430e0df7) | 4,042,885 | 5 USDFC | `0x8ef59739` | **Yes** — decision `8c158abd-fb71-4e63-83ab-04d5161d97a8`, in the **deployed** agent's Blob journal |
+| [`0x06e27a6a…`](https://filecoin-testnet.blockscout.com/tx/0x06e27a6a7fd532722727953b8d266f14d8109aaaa2c9edc8645bf17a1a2fcf6b) | 4,034,196 | 5 USDFC | `0x8ef59739` | **Yes** — decision `1b2d98ef-4984-482f-b394-498ea99b29a6`, in the **local** journal (`data/decisions.jsonl`, seq 13) |
+| [`0x17f5ecd7…`](https://filecoin-testnet.blockscout.com/tx/0x17f5ecd765fdef0078241ec1e5b76d4017c96305f7ee80b347bbd29f50d03ac3) | 4,033,951 | 5 USDFC | `0x8ef59739` | **No** — predates the journal |
+| [`0x45ee3b49…`](https://filecoin-testnet.blockscout.com/tx/0x45ee3b49ef5f247860181588b6a6f338fc09befcb3fe57af02de9b4a6608b005) | 4,033,821 | 20 USDFC | `0x7218b707` | n/a — **operator bootstrap**, not an agent decision |
 
-And the transaction that funded the account in the first place, [`0x45ee3b49…`](https://calibration.filfox.info/en/message/0x45ee3b49ef5f247860181588b6a6f338fc09befcb3fe57af02de9b4a6608b005) — 20 USDFC, **operator-run** via `npm run bootstrap -- fund`, which also established the Warm Storage operator approval. Not agent-authored, and never presented as such.
+**On that first row's two hashes.** The submitted hash and the indexed hash are not always the same string: the client computes one from the payload it signs, the chain files the message it accepted under another. Here they differ. `0x85a8d620…` is the journalled hash — recorded before the transaction existed, and therefore the one the autonomy claim rests on. `0x400ce862…` is the canonical hash, and therefore the one an explorer resolves. That they are one transaction is checkable three ways, all of which were run: `eth_getTransactionByHash` on `api.calibration.node.glif.io` **and** on the independent `filecoin-calibration.drpc.org` returns, for the submitted hash, a transaction whose own `hash` field reads `0x400ce862…`; `Filecoin.EthGetMessageCidByTransactionHash` maps both hashes to the one message CID `bafy2bzacecc2rvra…`, and `Filecoin.EthGetTransactionHashByCid` maps that CID back to the canonical hash; and Blockscout serves the canonical hash and 404s the submitted one. A Lotus node keeps a short-lived alias from the submitted hash, which is why it resolves either; an explorer only ever saw the message that landed. `npm run decisions` reports both when they disagree and links the canonical one — see `explorerTxHash()` in [`src/lib/txVerify.ts`](../src/lib/txVerify.ts).
+
+**The two headline proofs — cite these.** `0x85a8d620…` is the strongest, because a judge can reproduce the whole shape of it by pressing the buttons in the README's walkthrough: `npm run decisions -- --remote --id 8c158abd-fb71-4e63-83ab-04d5161d97a8` prints the reading, the rule that fired with its threshold, the reasoning built from those numbers, the outcome and this exact hash — a record written *before* the transaction existed. Its reasoning string predicted "extends runway to ~3966.8 days" and the next reading came back at 3966.77. `0x06e27a6a…` is the same claim against the local journal, provable offline with no credentials at all: `npm run decisions -- --id 1b2d98ef-4984-482f-b394-498ea99b29a6`.
+
+`0x17f5ecd7…` is real — made during live verification — but it predates the decision journal: it is not a line in `data/decisions.jsonl`, no `npm run decisions -- --id` command can produce it, and it must not be cited as agent-authored on the strength of this project's own evidence mechanism. Corroborating history, not proof.
+
+`0x45ee3b49…` is the transaction that funded the account in the first place — 20 USDFC, **operator-run** via `npm run bootstrap -- fund`, which also established the Warm Storage operator approval. Note the different selector: the bootstrap path calls a deposit-and-approve entry point, where the agent's own top-ups call the plain deposit. Not agent-authored, and never presented as such.
+
+**A caution about hashes that are in a journal but not on chain.** `data/decisions.jsonl` — the LIVE journal path — also contains eleven records at its head (seq 1–11), five of them `EMERGENCY_TOP_UP`s carrying hashes `0x4e32fb1b…`, `0x1946998b…`, `0x260c2b50…`, `0xf8ea8c2c…` and `0x737d1796…`. **Those hashes are on no chain.** They were minted by the mock adapter, which returns `` `0x${hex(32)}` `` from `deposit()`, and they are in this file because they were written before the two modes had separate default paths.
+
+They are stamped `"mode":"MOCK"`, which is what makes them harmless: `evidenceEntries()` filters to LIVE-with-a-hash, the store rehydrates scoped to its own mode, and `npm run decisions` prints them only under its **simulated transaction hashes (MOCK — NOT onchain, not evidence)** heading. `npm run decisions -- --split` copies them into `data/decisions.mock.jsonl` without modifying the source. *(An earlier revision of this section stated they carried a `"mode":"LIVE"` stamp. They do not, and never did; the file says `MOCK` on every one of those eleven lines. The claim is corrected here rather than removed.)*
+
+The stamp is no longer merely a matter of configuration either — see [§1](#1-proving-the-agent-authored-a-transaction) — because it is now taken from the adapter that produced the decision rather than from `FILRUNWAY_MODE`.
+
+**And a caution the other way, which matters more.** A `null` from `eth_getTransactionByHash` is **not** proof that a transaction never existed. Filecoin nodes keep the Ethereum-hash → message mapping for a limited window (three days by Lotus's default), and `api.calibration.node.glif.io` is a pool of nodes that is neither archival nor internally consistent. Asked twelve times in a row for `0x06e27a6a…` — a real transaction in block 4,034,196, in the table above — it confirmed twice and returned `null` ten times; the same endpoint then refused `eth_getBlockByNumber` for that block outright ("failed to retrieve messages and receipts"). Treating a null as a denial would therefore discredit this project's own genuine evidence within days of producing it.
+
+So: `npm run decisions` asks more than once, labels an unresolved older hash **UNCONFIRMED** rather than fake, and reserves **NOT ON CHAIN** for a record young enough that the node would still hold the mapping (the only case that exits non-zero). The rule is *verify the hash against a node and read the answer carefully*, not *quote what the journal says* — and not *assume a null means fabrication*. Explorer links keep full history; set `FILECOIN_RPC_URL` to an archival node to confirm older records from the CLI.
 
 Journals grow with every tick and a demo machine's file will not match this one line for line — always read the hash-and-decision pair off the machine you are demoing from rather than trusting a hash quoted in a document.
 
 **The honest split, before you go looking for it.** Of the USDFC that has been deposited into this account's Filecoin Pay balance, **5 USDFC per top-up is agent-initiated and 20 USDFC was operator bootstrap** (`npm run bootstrap -- fund`, `0x45ee3b49…` above). The agent made one journal-provable autonomous deposit, not the whole balance. That is the claim, and it is the whole claim: the operator set the account up so there would be a cost stream to manage at all, and the agent then decided, on its own, to add to it.
 
-The reason to say this first rather than let a judge find it: an autonomous top-up and an operator top-up are byte-identical on chain, so "the agent deposited this" is unverifiable from Filfox alone in either direction. What makes the one deposit *provably* the agent's is the decision recorded before it existed. Everything else in the account is the operator's, and is labelled as such here.
+The reason to say this first rather than let a judge find it: an autonomous top-up and an operator top-up are byte-identical on chain, so "the agent deposited this" is unverifiable from Blockscout alone in either direction. What makes the one deposit *provably* the agent's is the decision recorded before it existed. Everything else in the account is the operator's, and is labelled as such here.
 
 ### 12.3 Mock mode (`FILRUNWAY_MODE=mock`, the default)
 
@@ -1155,6 +1181,21 @@ Mock mode cannot be mistaken for live, and that is true of the **first painted f
 A live-mode misconfiguration fails loudly at construction rather than falling back to the mock (`src/lib/chain/index.ts:117`).
 
 Decisions taken in mock mode are journalled too, to their **own file** — `data/decisions.mock.jsonl`, not the LIVE `data/decisions.jsonl` — and every line is stamped `"mode":"MOCK"`. So a mock record cannot reach the evidentiary file in the first place, and if it is already there (from a journal written before the split, or from an explicit `FILRUNWAY_DECISION_LOG` pointing both modes at one path) the scoped read keeps it out of the LIVE dashboard and the LIVE listing anyway. A mock record read back months later can never be mistaken for evidence of an onchain action.
+
+### 12.4 The Filecoin primitives, by address
+
+Every address below is read from `synapse.chain.contracts` at runtime — **never hardcoded** (`src/lib/chain/synapse.ts:871`, and the PDP/view pair at `:611`) — so switching networks cannot silently point at the wrong pay contract. The values here are what the SDK's `calibration` chain definition resolves to; they are reproduced for a reader's convenience, and the code never reads them from this document.
+
+| Primitive | SDK key | Calibration address | What the agent reads or does |
+|---|---|---|---|
+| Filecoin Pay | `filecoinPay` | `0x09a0fDc2723fAd1A7b8e3e00eE5DF73841df55a0` | `accountSummary()` → `runwayInEpochs`, `availableFunds`, `debt`, `lockupRatePerEpoch`, `totalLockup`, `grossCoverageInEpochs`. The input the whole decision turns on. `fund()` is the `TOP_UP` action; `withdraw()` is the operator squeeze. |
+| PDP Verifier | `pdp` | `0x85e366Cf9DD2c0aE37E963d9556F5f4718d6417C` | `dataSetLive`, `getDataSetLastProvenEpoch`, `getNextChallengeEpoch` — three of the five proof fields. |
+| Warm Storage | `fwss` | `0x02925630df557F957f70E112bA06e50965417CA0` | `storage.prepare()` / `storage.upload()` created the cost stream. `terminateService()` is the `PRUNE_DATASET` action, gated off by default. |
+| Warm Storage State View | `fwssView` | `0x9BF9e67e83EC8613883FDdDec4D3b38AEE937177` | `provenThisPeriod`, `provingDeadline` — the two fields that separate *delinquent* from merely quiet. |
+| USDFC | `usdfc` | `0xb3042734b608a1B16e9e86B374A3f3e389B4cDf0` | The token the runway is denominated in; the wallet balance that makes `INSUFFICIENT_FUNDS` a real answer. |
+| Multicall3 | `multicall3` | `0xcA11bde05977b3631167028862bE2a173976CA11` | All proof reads for a data set go out as one `multicall({ allowFailure: true })`, so a partial read becomes a stated UNKNOWN instead of a false delinquency. |
+
+`getStatus()` surfaces `filecoinPay`, `fwss` and `usdfc` to the CLI and the dashboard alongside `synapse.chain.id` and `synapse.chain.name`, so a running instance will tell you which contracts it is actually pointed at rather than asking you to trust a constant.
 
 ---
 
@@ -1242,7 +1283,7 @@ Per file:
 | Deployment | Vercel. Project config in `vercel.ts`, type-checked against **`@vercel/config`** 0.7. Every value in it is static: a git-source deploy reads that file without evaluating it, so a computed value is dropped and fails schema validation. Cycle driven by a GitHub Actions workflow hitting `POST /api/tick` every 5 minutes, with a daily Vercel Cron Job as backstop; `maxDuration` 300s on the tick, squeeze and stream routes. |
 | Tests | Vitest 4, **532 tests across 27 files** |
 | Network | Filecoin Calibration, chain ID 314159, 30s epochs, 2880 epochs/day |
-| Explorer | Filfox, `https://calibration.filfox.info/en/message/<hash>` |
+| Explorer | Blockscout, `https://filecoin-testnet.blockscout.com/tx/<hash>` |
 
 Both `@filoz/synapse-sdk` and `@filoz/synapse-core` are listed in `serverExternalPackages` in `next.config.ts`: they are ESM-only and reach for Node built-ins, and they are only ever reachable through the server-only chain adapter.
 

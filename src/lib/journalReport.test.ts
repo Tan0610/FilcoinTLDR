@@ -263,7 +263,7 @@ describe("npm run decisions", () => {
     expect(evidence).not.toContain(SIMULATED_TX_HASH);
     expect(evidence).not.toContain("0xsimulated");
     // …and the real one is still cited as onchain, with its explorer link.
-    expect(evidence).toContain("calibration.filfox.info");
+    expect(evidence).toContain("filecoin-testnet.blockscout.com");
   }, 60_000);
 
   it("still excludes simulated hashes from that section at --mode all", () => {
@@ -322,7 +322,7 @@ describe("npm run decisions", () => {
     expect(out).toContain(`decision ${REAL_DECISION_ID}`);
     expect(out).toMatch(/^\s+mode\s+LIVE\s*$/m);
     expect(out).toMatch(new RegExp(String.raw`^\s+tx hash\s+${REAL_TX_HASH}\s*$`, "m"));
-    expect(out).toContain(`calibration.filfox.info/en/message/${REAL_TX_HASH}`);
+    expect(out).toContain(`filecoin-testnet.blockscout.com/tx/${REAL_TX_HASH}`);
     expect(out).toContain("EXECUTED");
     expect(out).not.toContain("SIMULATED");
   }, 60_000);
@@ -335,7 +335,7 @@ describe("npm run decisions", () => {
     expect(out).toContain("SIMULATED — MOCK ADAPTER");
     expect(out).toContain("tx hash (simulated)");
     // No explorer link is offered for a hash that is on no chain.
-    expect(out).not.toContain("filfox");
+    expect(out).not.toContain("blockscout");
   }, 60_000);
 
   it("carries the mode in --json", () => {

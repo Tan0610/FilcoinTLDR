@@ -22,7 +22,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 
 import { SynapseChainAdapter } from "../src/lib/chain/synapse";
-import { EPOCHS_PER_DAY, explorerMessageUrl, isUnboundedEpochs } from "../src/lib/constants";
+import { EPOCHS_PER_DAY, isUnboundedEpochs } from "../src/lib/constants";
+import { explorerTxUrl } from "../src/lib/explorer";
 import { DEMO_SCALE, suggestDemoScale } from "../src/lib/demo";
 import { formatUnits } from "../src/lib/units";
 
@@ -92,7 +93,7 @@ function parseSize(raw: string): number {
 }
 
 function txLink(hash: string): string {
-  return `${GREEN}${explorerMessageUrl(hash)}${RESET}`;
+  return `${GREEN}${explorerTxUrl(hash)}${RESET}`;
 }
 
 /* ---------- commands ---------- */

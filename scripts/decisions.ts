@@ -17,7 +17,7 @@
  * decision that preceded the agent's: the reading it was taken from, the rule
  * that fired, the reasoning, and the tx hash it produced. This prints that
  * record, so "the agent did this, not the operator" can be checked rather than
- * asserted — line up the hash below with the same hash on Filfox.
+ * asserted — line up the hash below with the same transaction on the explorer.
  *
  * MODE
  * ----
@@ -33,6 +33,31 @@
  *     scope. Simulated hashes get their own section, under their own heading,
  *     marked as not being onchain.
  *
+ * VERIFICATION
+ * ------------
+ * The mode stamp is this project's own bookkeeping, and bookkeeping can be
+ * wrong: `data/decisions.jsonl` still carries eleven MOCK records at its head,
+ * written into the LIVE path before the two modes had separate files, five of
+ * them holding hashes the mock adapter invented. Scoping keeps them out of the
+ * evidence section — but a filter we wrote is a weaker guarantee than an answer
+ * from the chain.
+ *
+ * So every hash this tool is about to present as evidence is looked up first
+ * with `eth_getTransactionByHash` and labelled with what came back. A hash that
+ * is not confirmed is never printed as proof.
+ *
+ * A NULL ANSWER IS NOT A DENIAL. Filecoin keeps the Ethereum-hash -> message
+ * mapping for about three days and the public Calibration endpoint is not
+ * archival, so this project's own genuine top-up stops resolving once it ages
+ * out — measured, not assumed; see `src/lib/txVerify.ts`. An unresolved hash is
+ * therefore reported as unconfirmed rather than as fake, EXCEPT where the
+ * record is young enough that the node would still hold the mapping, which is
+ * the one case that is a real accusation and the one case that exits non-zero.
+ *
+ * `--no-verify` skips the lookup and says on screen that it did. Uses
+ * `FILECOIN_RPC_URL` (point it at an archival node for older records) or the
+ * public Calibration node; still no key.
+ *
  * Reads the journal files the server writes — `FILRUNWAY_DECISION_LOG` when
  * set, otherwise `data/decisions.jsonl` (LIVE) and `data/decisions.mock.jsonl`
  * (MOCK) — and needs no key, no RPC and no running server. Both are read
@@ -42,7 +67,8 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import { EPOCHS_PER_DAY, explorerMessageUrl, isUnboundedEpochs } from "../src/lib/constants";
+import { EPOCHS_PER_DAY, isUnboundedEpochs } from "../src/lib/constants";
+import { explorerTxUrl } from "../src/lib/explorer";
 import { blobPrefix, readBlobJournal } from "../src/lib/blobJournal";
 import {
   JOURNAL_VERSION,
@@ -62,6 +88,17 @@ import {
   simulatedEntries,
   type ModeArg,
 } from "../src/lib/journalReport";
+import {
+  ETH_TX_INDEX_LIFETIME_DAYS,
+  explorerTxHash,
+  hashRewritten,
+  isDenied,
+  verdictLabel,
+  verifyRpcUrl,
+  verifyTxHash,
+  verifyTxHashes,
+  type TxCheck,
+} from "../src/lib/txVerify";
 import type { AgentMode, Decision } from "../src/lib/types";
 
 /** `.env.local` wins over `.env`, matching Next.js. Node 20.6+ has loadEnvFile. */
@@ -138,7 +175,7 @@ function line(entry: JournalEntry): string {
 }
 
 /** Everything about one decision, which is the evidentiary view. */
-function detail(entry: JournalEntry): void {
+async function detail(entry: JournalEntry, verify: boolean): Promise<void> {
   const { decision } = entry;
   heading(`decision ${decision.id}`);
   row("mode", modeTag(entry.mode));
@@ -155,7 +192,38 @@ function detail(entry: JournalEntry): void {
   row("top-up amount", decision.ruleFired ? `${decision.ruleFired.topUpAmount} USDFC` : "—");
   if (decision.txHash) {
     row(entry.mode === "MOCK" ? "tx hash (simulated)" : "tx hash", decision.txHash);
-    if (entry.mode === "LIVE") row("explorer", explorerMessageUrl(decision.txHash));
+    if (entry.mode === "LIVE") {
+      // This view is what a judge is pointed at by name, so the claim it makes
+      // is checked here rather than asserted from the record. A MOCK hash is
+      // not looked up: it was invented locally and the banner above already
+      // says so.
+      let check: TxCheck | undefined;
+      if (verify) {
+        check = await verifyTxHash(decision.txHash);
+        const accusation = isDenied(check, decision.at);
+        const color = check.verdict === "CONFIRMED" ? GREEN : accusation ? RED : YELLOW;
+        row("onchain", `${color}${verdictLabel(check, decision.at)}${RESET}`);
+        if (accusation) process.exitCode = 1;
+      } else {
+        row("onchain", `${YELLOW}not re-checked (--no-verify)${RESET}`);
+      }
+      // The link uses whatever hash the CHAIN filed this transaction under,
+      // which is usually the recorded one and occasionally is not. The row
+      // above still shows the journal's hash unchanged — that is the string
+      // being attested to. See `explorerTxHash()` in src/lib/txVerify.ts.
+      row("explorer", explorerTxUrl(explorerTxHash(decision.txHash, check)));
+      if (hashRewritten(decision.txHash, check)) {
+        row("onchain hash", check!.onchainHash!);
+        row(
+          "",
+          `${DIM}The chain indexes this message under that hash rather than the
+` +
+            `${" ".repeat(22)}recorded one. Both resolve to one message; a node accepts
+` +
+            `${" ".repeat(22)}either, an explorer only the canonical one.${RESET}`,
+        );
+      }
+    }
   }
   if (decision.error) row("error", `${RED}${decision.error}${RESET}`);
 
@@ -186,10 +254,22 @@ FilRunway decision log reader.
                                      Vercel Blob instead of the local files
   npm run decisions -- --split       copy MOCK records out of the LIVE journal
                                      into the MOCK one (add --write to apply)
+  npm run decisions -- --no-verify   skip the onchain re-check (offline)
 
 --mode defaults to FILRUNWAY_MODE. Whatever the scope, "transactions the agent
 authored" lists LIVE records only: a MOCK hash was invented by the mock adapter
 and is on no chain.
+
+Every hash in that section is re-checked against the chain with
+eth_getTransactionByHash before it is printed, and labelled with what came
+back. A hash this tool cannot resolve is never presented as proof.
+
+Note that a null answer is not a denial: Filecoin keeps the Ethereum tx-hash
+index for about three days and the public endpoint is not archival, so an older
+transaction stops resolving while remaining on chain. Those read as UNCONFIRMED.
+Only a record young enough that the node would still hold the mapping is
+reported as NOT ON CHAIN, and only that exits non-zero. Set FILECOIN_RPC_URL to
+an archival node to confirm older records; no key is used.
 
 Reads FILRUNWAY_DECISION_LOG when set, otherwise data/decisions.jsonl (LIVE)
 and data/decisions.mock.jsonl (MOCK). No key required.
@@ -376,7 +456,7 @@ async function main(): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    detail(found);
+    await detail(found, !args.includes("--no-verify"));
     return;
   }
 
@@ -454,6 +534,16 @@ async function main(): Promise<void> {
   const evidence = evidenceEntries(all.entries);
   const shownTx = evidence.slice(0, 10);
 
+  // Ask the chain before printing. A LIVE stamp is our own bookkeeping; only
+  // `eth_getTransactionByHash` can turn it into evidence, and a hash that does
+  // not come back gets said so out loud rather than dropped. See
+  // `src/lib/txVerify.ts` for why the failure case is its own third answer.
+  const verifying = !args.includes("--no-verify") && arg !== "MOCK" && shownTx.length > 0;
+  let checks = new Map<string, TxCheck>();
+  if (verifying) {
+    checks = await verifyTxHashes(shownTx.map(({ decision }) => decision.txHash!));
+  }
+
   heading(
     evidence.length > shownTx.length
       ? `transactions the agent authored (LIVE, onchain — most recent ${shownTx.length} of ${evidence.length})`
@@ -471,11 +561,64 @@ async function main(): Promise<void> {
   } else if (shownTx.length === 0) {
     console.log(`  ${DIM}None recorded. No LIVE decision has produced a transaction.${RESET}`);
   } else {
+    if (verifying) {
+      console.log(`  ${DIM}re-checked against ${verifyRpcUrl()} just now${RESET}\n`);
+    } else {
+      console.log(
+        `  ${YELLOW}Not re-checked against the chain (--no-verify).${RESET}\n` +
+          `  ${DIM}These hashes are this log's own claim, unconfirmed here.${RESET}\n`,
+      );
+    }
+
+    let denied = 0;
     for (const { decision } of shownTx) {
+      const check = checks.get(decision.txHash!);
+      // Green only for proof. An unresolved hash is not painted as a failure
+      // either: on a non-archival node that is usually the node's limitation,
+      // not the record's, and the label says which.
+      const accusation = isDenied(check, decision.at);
+      if (accusation) denied += 1;
+      const color = check?.verdict === "CONFIRMED" ? GREEN : accusation ? RED : YELLOW;
       console.log(`  ${decision.txHash}`);
-      console.log(`  ${DIM}${explorerMessageUrl(decision.txHash!)}${RESET}`);
+      if (check) console.log(`  ${color}${verdictLabel(check, decision.at)}${RESET}`);
+      console.log(`  ${DIM}${explorerTxUrl(explorerTxHash(decision.txHash!, check))}${RESET}`);
+      if (hashRewritten(decision.txHash!, check)) {
+        console.log(
+          `  ${DIM}chain indexes this as ${check!.onchainHash} — the link uses that${RESET}`,
+        );
+      }
       console.log(`  ${DIM}decision ${decision.id} · ${when(decision.at)} UTC${RESET}`);
       console.log(`  ${DIM}npm run decisions -- --id ${decision.id}${RESET}\n`);
+    }
+
+    // A LIVE record the node actively denies — young enough that it would still
+    // hold the mapping — is the one failure this whole mechanism exists to make
+    // impossible. It gets stated loudly rather than left as an odd label above.
+    if (denied > 0) {
+      console.log(
+        `  ${RED}${BOLD}${denied} hash${denied === 1 ? "" : "es"} above ` +
+          `${denied === 1 ? "is" : "are"} recorded LIVE and denied by the node.${RESET}\n` +
+          `  ${RED}${denied === 1 ? "It is" : "They are"} not evidence of anything. Treat the ` +
+          `rest of this log as sound\n  only where the label says confirmed.${RESET}\n`,
+      );
+      process.exitCode = 1;
+    }
+
+    // Not a defect, and it must not read as one: the public Calibration node
+    // keeps the eth-hash mapping for about three days and serves no archival
+    // history, so the project's own genuine evidence stops resolving with age.
+    const stale = shownTx.filter(
+      ({ decision }) =>
+        checks.get(decision.txHash!)?.verdict === "UNRESOLVED" && !isDenied(checks.get(decision.txHash!), decision.at),
+    ).length;
+    if (stale > 0) {
+      console.log(
+        `  ${DIM}${stale} hash${stale === 1 ? "" : "es"} above could not be resolved at this ` +
+          `node. Filecoin keeps the\n  Ethereum tx-hash index for about ` +
+          `${ETH_TX_INDEX_LIFETIME_DAYS} days and this endpoint is not archival, so an\n` +
+          `  older transaction stops resolving while remaining on chain. Point\n` +
+          `  FILECOIN_RPC_URL at an archival node, or open the explorer link.${RESET}\n`,
+      );
     }
   }
 

@@ -111,6 +111,7 @@ import {
   journalMode,
   nullJournal,
   parseJournal,
+  stampMode,
   type DecisionJournal,
   type JournalEnv,
   type JournalFileError,
@@ -545,12 +546,23 @@ export class BlobDecisionJournal implements DecisionJournal {
     return blobs;
   }
 
-  append(decision: Decision): void {
+  /**
+   * `sourceMode` decides the stamp, exactly as in the file journal — see
+   * `stampMode()` in `src/lib/journal.ts`.
+   *
+   * The SEGMENT still lives under this writer's own `live/` or `mock/` prefix,
+   * because that is a writer identity and not a claim about the record. Reads
+   * list both prefixes and scope on each line's own `mode` field, so a
+   * downgraded line parked in the `live/` prefix is still read as MOCK, still
+   * excluded from the evidence listing, and still disclosed as withheld.
+   */
+  append(decision: Decision, sourceMode: AgentMode = this.mode): void {
+    const stamp = stampMode(this.mode, sourceMode);
     this.appendLine((seq) => ({
       v: JOURNAL_VERSION,
       seq,
       writtenAt: Date.now(),
-      mode: this.mode,
+      mode: stamp,
       decision,
     }));
   }
@@ -562,13 +574,14 @@ export class BlobDecisionJournal implements DecisionJournal {
    * moment cannot lose each other's records, which is precisely the property
    * the withdrawal cap depends on. See `OperatorSqueeze` in `journal.ts`.
    */
-  appendSqueeze(squeeze: OperatorSqueeze): void {
+  appendSqueeze(squeeze: OperatorSqueeze, sourceMode: AgentMode = this.mode): void {
+    const stamp = stampMode(this.mode, sourceMode);
     this.appendLine((seq) => ({
       v: JOURNAL_VERSION,
       kind: "squeeze",
       seq,
       writtenAt: Date.now(),
-      mode: this.mode,
+      mode: stamp,
       squeeze,
     }));
   }

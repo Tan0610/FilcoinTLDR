@@ -2,7 +2,7 @@
 
 import { memo } from "react";
 
-import { explorerMessageUrl } from "@/lib/constants";
+import { EXPLORER_NAME, decisionTxUrl } from "@/lib/explorer";
 import {
   ACTION_LABEL,
   ACTION_VAR,
@@ -11,7 +11,7 @@ import {
   truncateMiddle,
 } from "@/lib/format";
 import { isDepositAction } from "@/lib/policy";
-import type { Decision, DecisionOutcome } from "@/lib/types";
+import type { AgentMode, Decision, DecisionOutcome } from "@/lib/types";
 import { SCROLL_FADE_STYLE, useScrollFade } from "@/lib/useScrollFade";
 
 const OUTCOME_STYLE: Record<DecisionOutcome, { label: string; color: string }> = {
@@ -168,7 +168,52 @@ function BlockedCard({ decision }: { decision: Decision }) {
  * state, so it gets the alarm chrome BlockedCard uses, plus the FAILED pill
  * ActionCard already defines and the error text itself.
  */
-function FailureCard({ decision }: { decision: Decision }) {
+/**
+ * The one clickable piece of evidence on a card, and the one place that decides
+ * whether it is clickable at all.
+ *
+ * A MOCK hash is minted by the mock adapter with `0x${hex(32)}` — well-formed,
+ * and corresponding to no transaction on any chain. Linking it sends a reader
+ * to a not-found page and, worse, dresses a simulated hash as chain evidence.
+ * So in MOCK the hash is still shown — it is what the journal recorded, and
+ * `npm run decisions` prints the same string — but as inert text under a
+ * SIMULATED tag rather than as an anchor. `decisionTxUrl()` owns that rule;
+ * see `src/lib/explorer.ts`.
+ */
+function TxRow({ decision, mode }: { decision: Decision; mode: AgentMode | null }) {
+  const href = decisionTxUrl(decision.txHash, mode);
+  const label = truncateMiddle(decision.txHash!, 14, 10);
+  return (
+    <>
+      <span className="text-ink-faint">TX</span>
+      {href === null ? (
+        <>
+          <span className="text-ink-dim">{label}</span>
+          <span
+            className="text-ink-faint"
+            title="Simulated by the mock adapter. No such transaction exists on any chain, so there is nothing to link to."
+          >
+            &middot; SIMULATED &middot; not on chain
+          </span>
+        </>
+      ) : (
+        <>
+          <a
+            className="text-accent underline underline-offset-4 hover:text-ink"
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+          >
+            {label}
+          </a>
+          <span className="text-ink-faint">&rarr; {EXPLORER_NAME}</span>
+        </>
+      )}
+    </>
+  );
+}
+
+function FailureCard({ decision, mode }: { decision: Decision; mode: AgentMode | null }) {
   const color = OUTCOME_STYLE.FAILED.color;
 
   return (
@@ -210,16 +255,7 @@ function FailureCard({ decision }: { decision: Decision }) {
 
       {decision.txHash && (
         <div className="flex flex-wrap items-center gap-2 border-t px-4 py-2 text-[12px]" style={{ borderColor: color }}>
-          <span className="text-ink-faint">TX</span>
-          <a
-            className="text-accent underline underline-offset-4 hover:text-ink"
-            href={explorerMessageUrl(decision.txHash)}
-            target="_blank"
-            rel="noreferrer"
-          >
-            {truncateMiddle(decision.txHash, 14, 10)}
-          </a>
-          <span className="text-ink-faint">&rarr; filfox</span>
+          <TxRow decision={decision} mode={mode} />
         </div>
       )}
 
@@ -233,7 +269,7 @@ function FailureCard({ decision }: { decision: Decision }) {
   );
 }
 
-function ActionCard({ decision }: { decision: Decision }) {
+function ActionCard({ decision, mode }: { decision: Decision; mode: AgentMode | null }) {
   const color = ACTION_VAR[decision.action];
   const outcome = OUTCOME_STYLE[decision.outcome];
 
@@ -272,16 +308,7 @@ function ActionCard({ decision }: { decision: Decision }) {
 
       {decision.txHash && (
         <div className="flex flex-wrap items-center gap-2 border-t border-line px-4 py-2 text-[12px]">
-          <span className="text-ink-faint">TX</span>
-          <a
-            className="text-accent underline underline-offset-4 hover:text-ink"
-            href={explorerMessageUrl(decision.txHash)}
-            target="_blank"
-            rel="noreferrer"
-          >
-            {truncateMiddle(decision.txHash, 14, 10)}
-          </a>
-          <span className="text-ink-faint">&rarr; filfox</span>
+          <TxRow decision={decision} mode={mode} />
           {/* Only a deposit may print a USDFC figure here. A PRUNE_DATASET card
               also carries `ruleFired` — the top-up it was taken instead of —
               and printing that rule's amount beside a termination hash would
@@ -310,9 +337,18 @@ function ActionCard({ decision }: { decision: Decision }) {
 
 export const DecisionFeed = memo(function DecisionFeed({
   decisions,
+  mode = null,
   journalError = null,
 }: {
   decisions: Decision[];
+  /**
+   * Which adapter produced these records. Decides whether a transaction hash
+   * is linked to the explorer or shown as inert, SIMULATED text — see
+   * `TxRow`. Defaults to null, which is treated as "not LIVE": withholding a
+   * link costs a reader one click, and presenting a fabricated hash as onchain
+   * costs the whole claim this project is making.
+   */
+  mode?: AgentMode | null;
   /**
    * Set when the durable log stopped being written. The count beside the
    * heading is otherwise read as "this is the record", and an empty feed above
@@ -367,7 +403,7 @@ export const DecisionFeed = memo(function DecisionFeed({
               // Outcome outranks action: a FAILED decision is a failure whether
               // the agent was holding, topping up or blocked when it broke.
               if (decision.outcome === "FAILED") {
-                return <FailureCard key={decision.id} decision={decision} />;
+                return <FailureCard key={decision.id} decision={decision} mode={mode} />;
               }
               if (decision.action === "HOLD") {
                 return <HoldCard key={decision.id} decision={decision} />;
@@ -383,7 +419,7 @@ export const DecisionFeed = memo(function DecisionFeed({
               ) {
                 return <BlockedCard key={decision.id} decision={decision} />;
               }
-              return <ActionCard key={decision.id} decision={decision} />;
+              return <ActionCard key={decision.id} decision={decision} mode={mode} />;
             })}
           </ul>
           {/* Without this the last card is sliced flush against the panel

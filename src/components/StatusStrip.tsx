@@ -1,6 +1,6 @@
 "use client";
 
-import { explorerAddressUrl } from "@/lib/constants";
+import { explorerAddressUrl } from "@/lib/explorer";
 import { formatAgo, formatCountdown, truncateMiddle } from "@/lib/format";
 import type { AgentMode, AgentStatus } from "@/lib/types";
 import { OperatorControls } from "./OperatorControls";

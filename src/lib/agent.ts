@@ -20,7 +20,8 @@
  */
 
 import { getChainAdapter } from "./chain";
-import { SENSE_INTERVAL_MS, TICK_INTERVAL_MS, explorerMessageUrl } from "./constants";
+import { SENSE_INTERVAL_MS, TICK_INTERVAL_MS } from "./constants";
+import { explorerTxUrl } from "./explorer";
 import { DEMO_LABEL, DEMO_SCALED, DEMO_SCALE_AGREEMENT, scaleRules } from "./demo";
 import { agentDriver, tickIntervalMs } from "./deployment";
 import { describeEvictionGate, evictionDisabledNote, evictionEnabled } from "./eviction";
@@ -478,7 +479,7 @@ async function executeTick(): Promise<Decision> {
   try {
     const adapter = getChainAdapter();
     const { txHash } = await adapter.deposit(amount);
-    const explorerUrl = explorerMessageUrl(txHash);
+    const explorerUrl = explorerTxUrl(txHash);
     const tracksConfirmation = typeof adapter.waitForTransaction === "function";
 
     store.publish({
@@ -783,7 +784,7 @@ export async function squeezeRunway(requested?: string | null): Promise<SqueezeO
     return { ok: false, status: 503, error: message };
   }
 
-  const explorerUrl = explorerMessageUrl(txHash);
+  const explorerUrl = explorerTxUrl(txHash);
   log(
     "warn",
     `OPERATOR ACTION: withdrawal of ${plan.amountUsdfc} USDFC submitted (${txHash.slice(0, 12)}…).`,

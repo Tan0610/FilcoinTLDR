@@ -28,7 +28,10 @@
  * and the earlier ones stay on disk as the proof of the transition.
  *
  * `mode` is stamped per record on purpose: a MOCK record must never be
- * mistakable for a LIVE one when the file is read back months later.
+ * mistakable for a LIVE one when the file is read back months later. The stamp
+ * comes from the ADAPTER that produced the decision and not from the
+ * environment — see `stampMode()`, which is where that distinction is enforced
+ * and why it has to be.
  *
  * TWO KINDS OF LINE
  * -----------------
@@ -253,8 +256,16 @@ export interface DecisionJournal {
    * Scoped to this journal's own mode unless another scope is asked for.
    */
   load(scope?: JournalScope): JournalLoad;
-  /** Append one record. Never throws. */
-  append(decision: Decision): void;
+  /**
+   * Append one record. Never throws.
+   *
+   * `sourceMode` is the mode of the ADAPTER that produced the decision, and it
+   * is what decides the stamp — see `stampMode()`. Omitted, the journal falls
+   * back to its own configured mode, which is right for a caller that IS the
+   * adapter boundary (the tests that drive a journal directly) and wrong for
+   * anything downstream of one. `AgentStore` always supplies it.
+   */
+  append(decision: Decision, sourceMode?: AgentMode): void;
   /**
    * Append one OPERATOR withdrawal. Never throws.
    *
@@ -264,7 +275,7 @@ export interface DecisionJournal {
    * degrades the withdrawal cap to per-process exactly as a disabled journal
    * degrades the spend cap. Both shipped journals implement it.
    */
-  appendSqueeze?(squeeze: OperatorSqueeze): void;
+  appendSqueeze?(squeeze: OperatorSqueeze, sourceMode?: AgentMode): void;
 
   /* ---------- remote journals only ---------- */
 
@@ -422,6 +433,39 @@ function isSqueezeRecord(value: unknown): value is SqueezeRecord {
  */
 function recordMode(record: JournalRecord | SqueezeRecord): AgentMode {
   return record.mode === "LIVE" ? "LIVE" : "MOCK";
+}
+
+/**
+ * The mode a line may be WRITTEN with. The write-side twin of `recordMode()`,
+ * and the same rule in the same direction: LIVE has to be earned.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * `journalMode()` below reads `FILRUNWAY_MODE` out of the environment, and
+ * that is the only thing that used to decide the stamp. But the environment is
+ * a statement of INTENT; the adapter is the statement of FACT. The two can
+ * disagree inside one process, and every way they can is a way a simulated
+ * transaction hash gets written into the live evidence log:
+ *
+ *   - `getChainAdapter()` caches its adapter on `globalThis` (see
+ *     `src/lib/chain/index.ts`). A process that built the mock adapter before
+ *     `FILRUNWAY_MODE=live` was in the environment — a `next dev` session whose
+ *     module graph reloads but whose globals do not — keeps the mock adapter
+ *     and gets a LIVE journal.
+ *   - `setChainAdapter()` installs a scripted adapter regardless of the
+ *     environment, which is exactly what the test suite does.
+ *   - Any harness that loads this repo's `.env` (it carries
+ *     `FILRUNWAY_MODE=live`) and then runs against the mock.
+ *
+ * The mock adapter mints its hashes with `0x${hex(32)}` and they are on no
+ * chain anywhere. A record stamped LIVE is this project's claim that its hash
+ * can be looked up; one that cannot be looked up discredits every record that
+ * can. So the stamp is the AND of both answers, and a disagreement resolves
+ * DOWN: a real transaction recorded as MOCK loses a claim, a simulated one
+ * recorded as LIVE fabricates evidence, and only one of those is survivable.
+ */
+export function stampMode(journalMode: AgentMode, sourceMode: AgentMode): AgentMode {
+  return journalMode === "LIVE" && sourceMode === "LIVE" ? "LIVE" : "MOCK";
 }
 
 /**
@@ -628,12 +672,13 @@ class FileDecisionJournal implements DecisionJournal {
     }
   }
 
-  append(decision: Decision): void {
+  append(decision: Decision, sourceMode: AgentMode = this.mode): void {
+    const stamp = stampMode(this.mode, sourceMode);
     this.writeLine((seq) => ({
       v: JOURNAL_VERSION,
       seq,
       writtenAt: Date.now(),
-      mode: this.mode,
+      mode: stamp,
       decision,
     }));
   }
@@ -647,13 +692,14 @@ class FileDecisionJournal implements DecisionJournal {
    * agent answered it" checkable months later. The `kind` marker is what keeps
    * the two from ever being confused for one another on the way back in.
    */
-  appendSqueeze(squeeze: OperatorSqueeze): void {
+  appendSqueeze(squeeze: OperatorSqueeze, sourceMode: AgentMode = this.mode): void {
+    const stamp = stampMode(this.mode, sourceMode);
     this.writeLine((seq) => ({
       v: JOURNAL_VERSION,
       kind: "squeeze",
       seq,
       writtenAt: Date.now(),
-      mode: this.mode,
+      mode: stamp,
       squeeze,
     }));
   }

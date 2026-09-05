@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 288 72" width="288" height="72" role="img" aria-label="FilRunway">
+  <title>FilRunway</title>
+  <!--
+    Mark + wordmark, on the dashboard's own dark plate so it survives both the
+    light and the dark GitHub theme. Palette is src/app/globals.css verbatim:
+    panel #0a1119, line #1b2836, ink #e9f3ff, ink-dim #8299ae,
+    ok #2ee6a8, warn #ffb62e, crit #ff4d63.
+
+    The wordmark is live text, not outlines, so this file stays readable as
+    source. textLength pins its width at 186 units and lengthAdjust="spacing"
+    distributes the slack as tracking, so the lockup holds its proportions
+    whichever monospace the renderer actually has.
+  -->
+  <rect width="288" height="72" rx="10" fill="#0a1119"/>
+  <rect x="0.75" y="0.75" width="286.5" height="70.5" rx="9.25" fill="none" stroke="#1b2836" stroke-width="1.5"/>
+
+  <!-- the mark: see mark.svg for the geometry notes -->
+  <g transform="translate(15 10.6) scale(0.8)">
+    <g fill="none" stroke-width="7.5" stroke-linecap="butt">
+      <path d="M 16.44 50.56 A 22 22 0 0 1 10.14 37.46" stroke="#ff4d63"/>
+      <path d="M 10.14 37.46 A 22 22 0 0 1 32 13"       stroke="#ffb62e"/>
+      <path d="M 32 13 A 22 22 0 0 1 47.56 50.56"       stroke="#2ee6a8"/>
+    </g>
+    <path d="M 43.17 20.71 L 46.28 23.83 L 29.10 42.71 L 24.29 37.90 Z" fill="#e9f3ff"/>
+    <circle cx="32" cy="35" r="4.4" fill="#e9f3ff"/>
+  </g>
+
+  <text x="82" y="45.5" textLength="186" lengthAdjust="spacing" font-size="28" font-weight="700"
+        font-family="Geist Mono, ui-monospace, SFMono-Regular, Menlo, Consolas, DejaVu Sans Mono, monospace">
+    <tspan fill="#8299ae">FIL</tspan><tspan fill="#e9f3ff">RUNWAY</tspan>
+  </text>
+</svg>

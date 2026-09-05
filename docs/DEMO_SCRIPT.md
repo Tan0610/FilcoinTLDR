@@ -1,6 +1,6 @@
 # FilRunway demo video script
 
-Target length: **2:30 to 3:00**. Hard requirement: the autonomous decision moment lands by **1:25 at the latest**, with a transaction hash visible and resolving on Filfox before 1:45.
+Target length: **2:30 to 3:00**. Hard requirement: the autonomous decision moment lands by **1:25 at the latest**, with a transaction hash visible and resolving on Blockscout before 1:45.
 
 Recorded in **live mode against Filecoin Calibration**. The mock-mode cutaway at the end is optional and is explicitly labelled on screen as simulated.
 
@@ -73,7 +73,7 @@ Choosing the scale is arithmetic, not tuning. Take your real runway `R` from `bo
 
 14. Dev server running, dashboard loaded at least once so `ensureAgentLoop()` has started.
 15. Browser at 1920x1080, zoom 100%, bookmarks bar hidden, no extensions visible, no notifications.
-16. Second browser tab pre-opened on `https://calibration.filfox.info/en/address/0x48c54EAb7039f43DcAEd14ba44b999E16a9309bD` so the Filfox cut is one keystroke away.
+16. Second browser tab pre-opened on `https://filecoin-testnet.blockscout.com/address/0x48c54EAb7039f43DcAEd14ba44b999E16a9309bD` so the Blockscout cut is one keystroke away.
 17. Terminal at a font size legible at 1080p, `bootstrap -- status` output already scrolled to the RUNWAY section. A **second terminal** ready for `npm run decisions`.
 18. Editor open on `src/lib/policy.ts`, scrolled so lines 119 to 135 are on screen (`evaluate()` through the rule branch).
 19. **Do not touch `RUN TICK NOW` during the decision beat.** The point is that nobody pressed anything. Keep the cursor away from that button and let the countdown reach zero on its own.
@@ -120,12 +120,12 @@ Choosing the scale is arithmetic, not tuning. Take your real runway `R` from `bo
 | **Then** | AGENT TRACE prints `Submitting deposit of 5 USDFC to Filecoin Pay...`, then `tx submitted`. The card's status pill turns `SUBMITTING`, and the truncated tx hash appears on it. |
 | **Say** | "There is the hash. Nobody pressed anything." |
 
-### 1:25 to 1:45 — Filfox
+### 1:25 to 1:45 — Blockscout
 
 | | |
 |---|---|
-| **On screen** | Click the tx hash on the decision card. It opens Filfox in a new tab. |
-| **Do** | Let the Filfox page load. Show the message: method, from address matching the status strip, value, status. |
+| **On screen** | Click the tx hash on the decision card. It opens Blockscout in a new tab. |
+| **Do** | Let the Blockscout page load. Show the message: method, from address matching the status strip, value, status. |
 | **Say** | "Same hash, on the public explorer. Same address as the one in the header. That is a real message on Calibration, submitted by a process that decided to submit it fifteen seconds ago." Say "a minute ago" instead if you are recording the deployment, where the cycle runs once a minute. |
 | **Then** | Back to the dashboard tab. The status pill has moved to `EXECUTED` and the trace reads `Deposit confirmed onchain`. |
 
@@ -142,8 +142,8 @@ Choosing the scale is arithmetic, not tuning. Take your real runway `R` from `bo
 | | |
 |---|---|
 | **On screen** | Second terminal. Run `npm run decisions -- --executed`, then `npm run decisions -- --id <the id beside the hash>`. |
-| **Do** | Let the full record render: the reading, the rule, the reasoning, the outcome, the hash and its Filfox URL. Put the hash on screen beside the Filfox tab from the previous beat if you can frame both. |
-| **Say** | "Here is why you should believe that was the agent and not me. A deposit made by the agent and a deposit I make from the CLI are byte-identical on chain — the hash proves money moved, it does not prove who moved it. So every decision gets appended to a log before the transaction exists. This is that record: the balance it read, the rule that fired, the sentence it wrote, and the hash it produced. Same hash as the one on Filfox. No key needed to read this, no server running." |
+| **Do** | Let the full record render: the reading, the rule, the reasoning, the outcome, the hash and its Blockscout URL. Put the hash on screen beside the Blockscout tab from the previous beat if you can frame both. |
+| **Say** | "Here is why you should believe that was the agent and not me. A deposit made by the agent and a deposit I make from the CLI are byte-identical on chain — the hash proves money moved, it does not prove who moved it. So every decision gets appended to a log before the transaction exists. This is that record: the balance it read, the rule that fired, the sentence it wrote, and the hash it produced. Same hash as the one the explorer just showed you. No key needed to read this, no server running." |
 | **If a `not shown  N MOCK decisions` line is on screen** | Do not skip past it, use it. One extra sentence: "That line is the tool telling me it is only showing me live records and that there are simulated ones it is deliberately not counting. Every row here carries its mode, and the transaction section at the bottom only ever lists live ones — simulated hashes get their own section that says, in those words, not onchain, not evidence." It is a stronger beat than pretending the mock rehearsal never happened. |
 
 ### 2:20 to 2:35 — Where the decision lives
@@ -216,10 +216,22 @@ Filecoin blocks are 30 seconds. Confirmation typically lands in 30 to 90 seconds
 
 The judged moment is the **decision plus the submitted hash**, not the receipt. If confirmation is slow:
 
-1. Keep talking. Move to the Filfox cut immediately with the hash you already have. A pending message on Filfox is still proof the transaction exists and was submitted by that address.
+1. Keep talking. Move to the Blockscout cut immediately with the hash you already have. A pending message on Blockscout is still proof the transaction exists and was submitted by that address.
 2. Record the HOLD beat (1:45), the evidence beat (2:05) and the code beat (2:20) while you wait. Confirmation will land underneath you.
-3. If it still has not confirmed by the end of the take, cut to the confirmed Filfox page and the `EXECUTED` card as a separate shot, with an on-screen caption saying how long it took, for example `confirmed 71s later`. Do not present the two as continuous footage without the caption.
+3. If it still has not confirmed by the end of the take, cut to the confirmed Blockscout page and the `EXECUTED` card as a separate shot, with an on-screen caption saying how long it took, for example `confirmed 71s later`. Do not present the two as continuous footage without the caption.
 4. **Never substitute a hash from a different run.** If the take is unusable, re-arm and shoot it again. A judge who catches a spliced hash discounts everything else in the video.
+
+### The explorer says "not found" for the hash on the card
+
+Rare, and not a defect in the transaction — but know the move before it happens on camera.
+
+The hash a client computes when it signs and the hash the chain files the message under come from different bytes, and they occasionally differ. One of the agent's four real top-ups is journalled as `0x85a8d620…` while the chain indexes it as `0x400ce862…`; a Lotus node resolves either, an explorer only the canonical one. The decision card links the hash the agent recorded, because that is the string the journal is attesting to and nothing synchronous can know the other one.
+
+If the tx link lands on a not-found page:
+
+1. **Do not re-shoot and do not apologise for the hash.** The transaction is real; the explorer simply files it under its own name.
+2. Cut to the **agent address** tab instead — `https://filecoin-testnet.blockscout.com/address/0x48c54EAb7039f43DcAEd14ba44b999E16a9309bD`. The deposit is the top row of that account's transaction list, with the same block, method and value. That page always resolves.
+3. If you want the canonical hash on screen, `npm run decisions -- --id <id>` prints it beside the recorded one and links it, whenever the two disagree.
 
 ### The wallet can't cover the deposit
 

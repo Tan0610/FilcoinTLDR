@@ -9,12 +9,16 @@
 export const EPOCH_SECONDS = 30;
 export const EPOCHS_PER_DAY = (24 * 60 * 60) / EPOCH_SECONDS; // 2880
 
-/** Filfox explorer (Calibration testnet). */
-export const EXPLORER_BASE = "https://calibration.filfox.info/en";
-export const explorerMessageUrl = (txHash: string) =>
-  `${EXPLORER_BASE}/message/${txHash}`;
-export const explorerAddressUrl = (address: string) =>
-  `${EXPLORER_BASE}/address/${address}`;
+/**
+ * Block-explorer links live in `src/lib/explorer.ts`.
+ *
+ * They used to be three lines here, pointing at Filfox — and every link they
+ * built was dead, because Filfox indexes Filecoin-native message CIDs and
+ * `t4` addresses rather than the `0x` forms this agent produces. Getting that
+ * right needs a paragraph of reasoning about which explorer indexes what, and
+ * a rule about when a hash must NOT be linked at all, which is more than a
+ * constants file should be carrying.
+ */
 
 /** How often the agent runs a full sense -> decide -> act cycle. */
 export const TICK_INTERVAL_MS = 15_000;
