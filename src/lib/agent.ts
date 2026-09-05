@@ -28,6 +28,12 @@ import { DEFAULT_RULES, evaluate, newDecisionId } from "./policy";
 import { proofSnapshotFrom, unreadableProofSnapshot } from "./proof";
 import { planSqueeze, squeezeLimits } from "./squeeze";
 import {
+  checkSqueezeCap,
+  describeSqueezeCap,
+  squeezeCapEnabled,
+  squeezeCapLimits,
+} from "./squeezeGuard";
+import {
   checkSpend,
   describeLimits,
   spendCapEnabled,
@@ -635,7 +641,21 @@ async function executePrune(decision: Decision): Promise<Decision> {
 
 export type SqueezeOutcome =
   | { ok: true; result: SqueezeResponse }
-  | { ok: false; status: 400 | 501 | 503; error: string };
+  /**
+   * 429 is the operator withdrawal cap: the request was well-formed and the
+   * account could have covered it, but this demo's rolling 24h budget is spent.
+   * Kept distinct from the 400s so an operator can tell "ask for less" from
+   * "come back later". See `src/lib/squeezeGuard.ts`.
+   */
+  | { ok: false; status: 400 | 429 | 501 | 503; error: string };
+
+/** Id for one operator withdrawal. Prefixed so it can never read as a decision. */
+function newSqueezeId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return `sqz_${globalThis.crypto.randomUUID()}`;
+  }
+  return `sqz_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
 
 /**
  * Withdraw USDFC from Filecoin Pay back to the agent's wallet, on an
@@ -655,6 +675,22 @@ export type SqueezeOutcome =
  * The agent's response on the following tick is the autonomous part. That
  * distinction is the whole reason this is a separate, human-authenticated
  * endpoint rather than another branch of the policy engine.
+ *
+ * WHAT BOUNDS IT
+ * --------------
+ * Three things, in order, and none of them touches the chain until all three
+ * have passed:
+ *
+ *   1. `planSqueeze` — the per-call ceiling, and never more than Filecoin Pay
+ *      reports unlocked (so lockup is untouchable).
+ *   2. `checkSqueezeCap` — at most N withdrawals and M USDFC per rolling 24h,
+ *      counted from the DURABLE journal so the limit survives Function instance
+ *      churn, plus a reserve floor under the unlocked balance.
+ *   3. the confirmation wait — a withdrawal that does not stand is not charged
+ *      to the window.
+ *
+ * A confirmed withdrawal is recorded as an `OperatorSqueeze` journal record. It
+ * is not, and cannot become, a `Decision`.
  */
 export async function squeezeRunway(requested?: string | null): Promise<SqueezeOutcome> {
   const adapter = getChainAdapter();
@@ -685,6 +721,46 @@ export async function squeezeRunway(requested?: string | null): Promise<SqueezeO
   const plan = planSqueeze(requested, before.fundsAvailable, squeezeLimits());
   if (!plan.ok) return { ok: false, status: 400, error: plan.reason };
 
+  // THE ROLLING CAP. Checked after the per-call bounds and before anything
+  // touches the chain, so a refused squeeze provokes no transaction at all.
+  //
+  // The operator secret is published so judges can drive this demo themselves.
+  // Nothing can be stolen with it — a withdrawal moves USDFC from Filecoin Pay
+  // to the agent's own wallet — but a loop against it would empty the account,
+  // exhaust the agent's own daily deposit allowance answering, and leave the
+  // public dashboard reading a true, permanent zero. See `squeezeGuard.ts`.
+  const store = getStore();
+  const at = Date.now();
+  if (squeezeCapEnabled(adapter.mode)) {
+    const verdict = checkSqueezeCap(
+      store.squeezeEntries(),
+      plan.amountUsdfc,
+      before.fundsAvailable,
+      at,
+      squeezeCapLimits(),
+    );
+    if (!verdict.allowed) {
+      // Logged, not journalled and NOT a decision: nobody decided anything
+      // here, a human was told no. The dashboard's operator strip renders the
+      // error body verbatim, so this reaches the screen as it stands.
+      log("warn", `OPERATOR ACTION refused: ${verdict.reason}`);
+      // A reserve refusal means "ask for less" (400); a window refusal means
+      // "come back later" (429). They are not the same instruction.
+      return {
+        ok: false,
+        status: verdict.limit === "RESERVE" ? 400 : 429,
+        error: verdict.reason,
+      };
+    }
+  }
+
+  // Take the slot before the transaction, not after. Inside one Function
+  // instance a loop is far faster than a chain round trip, and a counter that
+  // only moved on confirmation would let a dozen withdrawals start before the
+  // first one landed. Given back below if this one does not stand.
+  const squeezeId = newSqueezeId();
+  store.reserveSqueeze({ id: squeezeId, at, amountUsdfc: plan.amountUsdfc });
+
   log("warn", `OPERATOR ACTION: ${plan.note}`);
   // Pinned, because it outlives the trace and it is the answer to "did the
   // agent cause this?". Idempotent by key: a second squeeze restates nothing.
@@ -700,6 +776,8 @@ export async function squeezeRunway(requested?: string | null): Promise<SqueezeO
   try {
     ({ txHash } = await adapter.withdraw(plan.amountUsdfc));
   } catch (error) {
+    // Nothing left the account, so nothing is charged to the window.
+    store.releaseSqueeze(squeezeId);
     const message = errorMessage(error);
     log("error", `OPERATOR ACTION failed: withdrawal of ${plan.amountUsdfc} USDFC — ${message}`);
     return { ok: false, status: 503, error: message };
@@ -716,11 +794,22 @@ export async function squeezeRunway(requested?: string | null): Promise<SqueezeO
       .waitForTransaction(txHash)
       .catch((error: unknown) => ({ status: "FAILED" as const, error: errorMessage(error) }));
     if (result.status === "FAILED") {
+      // It did not stand, so the runway did not move and the window is not
+      // charged for it — the same rule the deposit cap applies to a deposit
+      // that failed to confirm.
+      store.releaseSqueeze(squeezeId);
       const message = result.error ?? "Withdrawal failed to confirm";
       log("error", `OPERATOR ACTION did not confirm: ${message}`);
       return { ok: false, status: 503, error: message };
     }
   }
+
+  // It stands. Persist it, so the cap outlives this Function instance. This is
+  // NOT a decision and never becomes one: it is written to the journal as an
+  // `OperatorSqueeze` record, which nothing in the decision feed, the totals or
+  // the deposits tile ever reads.
+  store.recordSqueeze({ id: squeezeId, at, amountUsdfc: plan.amountUsdfc, txHash });
+  await store.flushJournal();
 
   const after = await sense().catch(() => null);
   log(
@@ -793,6 +882,14 @@ export function ensureAgentLoop(): void {
     // Raised only when the cap is actually in force — a MOCK run states nothing,
     // since claiming a limit that is not enforced would be worse than silence.
     notice("spend-cap", "info", describeLimits(spendLimits()));
+  }
+  if (squeezeCapEnabled(getChainAdapter().mode)) {
+    // The other direction of travel, pinned for the same reason: the operator
+    // secret is published so judges can drive this demo, and a judge whose
+    // squeeze is refused has to be able to see, standing on the page, that the
+    // budget is bounded on purpose rather than that the deployment is broken.
+    // Raised only when the cap is genuinely enforced.
+    notice("squeeze-cap", "info", describeSqueezeCap(squeezeCapLimits()));
   }
   if (evictionEnabled()) {
     // Pinned, and raised ONLY when the capability is actually armed. A viewer

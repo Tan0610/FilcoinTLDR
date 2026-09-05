@@ -144,6 +144,8 @@ function recordingJournal(seed: Decision[] = []): DecisionJournal & { appended: 
     lastError: null,
     load: (): JournalLoad => ({
       decisions: [...seed].sort((a, b) => b.at - a.at || b.id.localeCompare(a.id)),
+      squeezes: [],
+      squeezeEntries: [],
       entries: [...seed]
         .sort((a, b) => b.at - a.at || b.id.localeCompare(a.id))
         .map((decision) => ({ mode: "MOCK" as const, decision })),
@@ -566,6 +568,8 @@ describe("runTick: durable record", () => {
       load: () => ({
         decisions: [],
         entries: [],
+        squeezes: [],
+        squeezeEntries: [],
         totals: store.totals,
         byMode: { MOCK: 0, LIVE: 0 },
         scope: "MOCK",
@@ -688,6 +692,8 @@ describe("a journal that disables itself during flush, not during append", () =>
       load: (): JournalLoad => ({
         decisions: [],
         entries: [],
+        squeezes: [],
+        squeezeEntries: [],
         totals: store.totals,
         byMode: { MOCK: 0, LIVE: 0 },
         scope: "MOCK",

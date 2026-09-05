@@ -35,8 +35,10 @@ import {
   totalsFor,
   type DecisionJournal,
   type JournalLoad,
+  type OperatorSqueeze,
 } from "./journal";
 import { spendEntriesFrom, type SpendEntry } from "./spendGuard";
+import { squeezeEntriesFrom, type SqueezeEntry } from "./squeezeGuard";
 import type {
   AgentEvent,
   AgentNotice,
@@ -70,6 +72,9 @@ const MAX_REFRESH_REPUBLISH = 20;
 
 /** Deposits remembered for the safety cap. Far more than any window needs. */
 const MAX_SPEND_ENTRIES = 500;
+
+/** Operator withdrawals remembered for the squeeze cap. Same reasoning. */
+const MAX_SQUEEZE_ENTRIES = 500;
 
 type Subscriber = (event: AgentEvent) => void;
 
@@ -128,6 +133,18 @@ class AgentStore {
    * which is also what makes the cap hold across Function instances.
    */
   private spend = new Map<string, SpendEntry>();
+
+  /**
+   * Operator withdrawals counted against the SQUEEZE cap, keyed by the durable
+   * squeeze record that authored them.
+   *
+   * The same problem as `spend`, from the opposite direction: `/api/squeeze`
+   * takes money OUT of Filecoin Pay, its secret is published so judges can
+   * drive the demo, and a limit that reset whenever a Function instance was
+   * recycled would not be a limit. Seeded from the whole journal on hydrate and
+   * on every refresh. See `src/lib/squeezeGuard.ts`.
+   */
+  private squeezes = new Map<string, SqueezeEntry>();
 
   private lastRefreshAt = 0;
   private refreshing: Promise<void> | null = null;
@@ -245,6 +262,12 @@ class AgentStore {
 
     for (const entry of spendEntriesFrom(loaded.decisions)) this.spend.set(entry.id, entry);
     this.pruneSpend();
+
+    // The same seeding, for the other direction of travel. Operator squeezes
+    // are journalled as their own record kind and never as decisions, so this
+    // reads a different list and touches nothing above.
+    for (const entry of squeezeEntriesFrom(loaded.squeezes)) this.squeezes.set(entry.id, entry);
+    this.pruneSqueezes();
 
     this.lastTickAt =
       this.lastTickAt === null
@@ -499,6 +522,63 @@ class AgentStore {
     if (this.spend.size <= MAX_SPEND_ENTRIES) return;
     const ordered = [...this.spend.values()].sort((a, b) => b.at - a.at);
     this.spend = new Map(ordered.slice(0, MAX_SPEND_ENTRIES).map((e) => [e.id, e]));
+  }
+
+  /* ---------- the operator withdrawal cap's ledger ---------- */
+
+  /**
+   * Count a withdrawal against the operator's cap, in memory.
+   *
+   * Called BEFORE the transaction is submitted, unlike `recordSpend`. The
+   * threat this cap answers is a loop against a published secret, and inside
+   * one Function instance that loop is faster than any chain round trip: a
+   * counter that only moved once a withdrawal had confirmed would let a dozen
+   * of them start before the first one landed. So the slot is taken up front
+   * and given back by `releaseSqueeze` if the withdrawal never stands.
+   */
+  reserveSqueeze(entry: SqueezeEntry): void {
+    this.squeezes.set(entry.id, entry);
+    this.pruneSqueezes();
+  }
+
+  /**
+   * Stop counting a withdrawal that did not stand — one that was refused by the
+   * chain, or submitted and never confirmed. Keeps the in-memory count equal to
+   * the durable record, which holds confirmed withdrawals only.
+   */
+  releaseSqueeze(id: string): void {
+    this.squeezes.delete(id);
+  }
+
+  /**
+   * Persist a CONFIRMED withdrawal, so the cap survives this instance.
+   *
+   * Written only after the transaction stands, exactly as a deposit is only
+   * journalled EXECUTED once it has. The record is not a `Decision` and never
+   * enters the decision feed, the totals or the deposits tile — see
+   * `OperatorSqueeze` in `src/lib/journal.ts` for why it is in the journal at
+   * all.
+   */
+  recordSqueeze(squeeze: OperatorSqueeze): void {
+    this.reserveSqueeze({
+      id: squeeze.id,
+      at: squeeze.at,
+      amountUsdfc: squeeze.amountUsdfc,
+    });
+    if (!this.journal.enabled) return;
+    this.journal.appendSqueeze?.(squeeze);
+    this.checkJournalHealth();
+  }
+
+  /** Withdrawals the cap should consider, newest first. */
+  squeezeEntries(): SqueezeEntry[] {
+    return [...this.squeezes.values()].sort((a, b) => b.at - a.at);
+  }
+
+  private pruneSqueezes(): void {
+    if (this.squeezes.size <= MAX_SQUEEZE_ENTRIES) return;
+    const ordered = [...this.squeezes.values()].sort((a, b) => b.at - a.at);
+    this.squeezes = new Map(ordered.slice(0, MAX_SQUEEZE_ENTRIES).map((e) => [e.id, e]));
   }
 
   publish(event: AgentEvent): void {

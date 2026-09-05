@@ -118,6 +118,8 @@ import {
   type JournalLoad,
   type JournalRecord,
   type JournalScope,
+  type OperatorSqueeze,
+  type SqueezeRecord,
 } from "./journal";
 import type { AgentMode, Decision } from "./types";
 
@@ -544,16 +546,37 @@ export class BlobDecisionJournal implements DecisionJournal {
   }
 
   append(decision: Decision): void {
-    if (!this.on) return;
-    this.seq += 1;
-    const record: JournalRecord = {
+    this.appendLine((seq) => ({
       v: JOURNAL_VERSION,
-      seq: this.seq,
+      seq,
       writtenAt: Date.now(),
       mode: this.mode,
       decision,
-    };
-    this.lines.push(JSON.stringify(record));
+    }));
+  }
+
+  /**
+   * One OPERATOR withdrawal, into this writer's own segment like any other
+   * line. It rides the same append-only segment machinery — no shared object,
+   * no read-modify-write — so two Function instances squeezing at the same
+   * moment cannot lose each other's records, which is precisely the property
+   * the withdrawal cap depends on. See `OperatorSqueeze` in `journal.ts`.
+   */
+  appendSqueeze(squeeze: OperatorSqueeze): void {
+    this.appendLine((seq) => ({
+      v: JOURNAL_VERSION,
+      kind: "squeeze",
+      seq,
+      writtenAt: Date.now(),
+      mode: this.mode,
+      squeeze,
+    }));
+  }
+
+  private appendLine(build: (seq: number) => JournalRecord | SqueezeRecord): void {
+    if (!this.on) return;
+    this.seq += 1;
+    this.lines.push(JSON.stringify(build(this.seq)));
     this.schedule();
   }
 

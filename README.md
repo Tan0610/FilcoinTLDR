@@ -4,10 +4,47 @@
 
 ### ▶ Live: **https://filrunway.vercel.app**
 
+**You can drive it yourself.** The operator secret and a two-minute click-path are in [**Drive the demo yourself**](#drive-the-demo-yourself), just below.
+
 Built for **FilecoinTLDR Builder Challenge Cycle 4 — "Build an AI Agent That Manages Its Own Storage Budget."** Direction: **Stay Alive + Show the Meter.**
 Network: **Filecoin Calibration testnet**, chain ID `314159`. Nothing here touches mainnet.
 
 Deep reference: **[`docs/DEEP_DIVE.md`](docs/DEEP_DIVE.md)** · Video script: [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md) · Showcase copy: [`docs/SHOWCASE.md`](docs/SHOWCASE.md)
+
+---
+
+## Drive the demo yourself
+
+The two `OPERATOR` controls on the live dashboard — `RUN TICK NOW` and `SQUEEZE RUNWAY` — are authenticated, and the credential that unlocks them is published here **deliberately, for judging**. Paste it into the `OPERATOR` field on the page. It is held in component state in your browser tab only: never stored, never in the client bundle, never sent anywhere but the two endpoints it authorises.
+
+<!-- REPLACE the placeholder inside the block below with the real CRON_SECRET value before committing. -->
+
+```text
+PASTE_CRON_SECRET_HERE
+```
+
+**What you are being handed, stated plainly rather than reassuringly.** This is a Calibration testnet account holding faucet funds; there is no mainnet exposure. `SQUEEZE RUNWAY` performs a real `payments.withdraw()` from Filecoin Pay back to the agent's **own** wallet — both ends of that transfer are the same account, so the control moves funds between the agent's own two balances and cannot redirect them to you or to anyone else. `RUN TICK NOW` can only make the agent deposit *into* its own Filecoin Pay balance, and the spend guard caps that at 3 deposits and 20 USDFC per rolling 24 hours; a tick that would cross either limit records a `SAFETY_CAP` decision instead of transacting. Withdrawals have a matching guard of their own: at most **5 USDFC per call**, at most **6 squeezes and 8 USDFC per rolling 24 hours**, and never below a **1 USDFC unlocked reserve** in Filecoin Pay. That budget is three full crisis-and-recovery cycles — one cycle costs about 2 USDFC of withdrawal — and it is deliberately smaller than the 15 USDFC the agent may deposit back over the same window, so a day of hard use cannot leave the account lower than it started. A squeeze past the cap is refused with a message naming the limit, what has already been used and the UTC time it resets; nothing is submitted and the agent keeps ticking. The bounds, the refusal wording and the reasoning behind them are in [**deep dive §7**](docs/DEEP_DIVE.md#7-the-operator-squeeze).
+
+**The click path.** About two minutes.
+
+1. Paste the secret above into the `OPERATOR` field. Both buttons arm.
+2. Press **`SQUEEZE RUNWAY` twice.** Each press withdraws 1 USDFC, worth roughly 125 days at the ×480 demo scale, and from a healthy ~3,966 days two presses are what it takes to fall through the 3,360-day top-up threshold. The collapse is genuine because the withdrawal is. A pinned disclosure appears saying a human caused it.
+3. Press **`RUN TICK NOW`.** The agent senses, evaluates, and returns `TOP_UP` — a real 5 USDFC deposit. Follow the hash on the decision card to Filfox.
+4. Watch the gauge climb back over the threshold as the deposit confirms.
+5. Press **`RUN TICK NOW`** again. `HOLD`.
+
+**What you are actually looking at.** You manufactured the crisis; the agent chose the response; and then the agent stopped — not because you told it to, but because its own deposit had fixed the problem it was reacting to. Step 3 is the part worth checking closely: the `TOP_UP` reasoning states the post-deposit runway *before* the money moves — *"Depositing 5 USDFC extends runway to ~3966.8 days"* — and in step 4 the gauge lands on that number. On the run these figures come from, runway went **3341.79 → 3966.77 days** and the Filecoin Pay balance **26.7348 → 31.7348 USDFC**, on tx `0x85a8d6207fab…b1cd0a5e9d`.
+
+**If the caps are already spent, that is the demo too.** Someone may have run this before you — the withdrawal budget is three cycles a day and the deposit budget is three top-ups a day, on purpose. A refused squeeze returns `429` with a line naming the bound it hit and the UTC time it relaxes, shown on the operator strip; a tick with no deposit budget left records an amber `SAFETY_CAP` card — the rule that fired still shown in front of the agent's own refusal to act on it — rather than a transaction. That is the guard working, not the demo breaking. Both windows are rolling and both are counted from the durable journal rather than from a server's memory, so they recover on their own, exactly on schedule, with no operator involved.
+
+**Behind any transaction there is a decision record.** Every card carries its decision id, and one command prints what was behind it:
+
+```bash
+npm run decisions -- --id <id>            # local journal
+npm run decisions -- --remote --id <id>   # the deployed agent's journal
+```
+
+That prints the exact Filecoin Pay reading the agent was looking at, the rule that fired with its threshold, the reasoning string it built from those numbers, the outcome and the hash — a record written *before* the transaction existed. See [Proof the agent acted](#proof-the-agent-acted).
 
 ---
 
@@ -34,7 +71,7 @@ If you have one minute, read these five places in this order.
 | 1 | The runway is **read from the chain**, not derived | `src/lib/chain/synapse.ts` | `getSnapshot()` line 423 calls `synapse.payments.accountSummary()` — line 427 |
 | 2 | `runwayInEpochs` becomes the snapshot | `src/lib/chain/synapse.ts` | `toRunwaySnapshot()` line 131, `runwayEpochsToNumber()` line 102 |
 | 3 | **The decision itself.** Pure function, zero I/O | `src/lib/policy.ts` | `evaluate()` line 211; rule selection line 223; `selectRule()` line 140 |
-| 4 | The agent acts on it, unprompted — or declines, in one of three ways | `src/lib/agent.ts` | `executeTick()` line 382: `evaluate(...)` line 424, `applySpendCap(...)` line 430 (defined line 92), `applyEvictionGate(...)` line 431 (defined line 126), `SAFETY_CAP` return line 442, `INSUFFICIENT_FUNDS` return line 449, `PRUNE_DATASET` branch line 461, `adapter.deposit(...)` line 474 |
+| 4 | The agent acts on it, unprompted — or declines, in one of three ways | `src/lib/agent.ts` | `executeTick()` line 388: `evaluate(...)` line 430, `applySpendCap(...)` line 436 (defined line 98), `applyEvictionGate(...)` line 437 (defined line 132), `SAFETY_CAP` return line 447, `INSUFFICIENT_FUNDS` return line 454, `PRUNE_DATASET` branch line 467, `adapter.deposit(...)` line 480 |
 | 5 | The deposit is a real onchain transaction | `src/lib/chain/synapse.ts` | `deposit()` line 451 calls `synapse.payments.fund({ amount })` — line 458 |
 
 The single load-bearing line is **`src/lib/policy.ts:223`**:
@@ -84,7 +121,7 @@ Records are stamped `MOCK` or `LIVE` per line, writes go to separate files per m
 
 1. **Open [filrunway.vercel.app](https://filrunway.vercel.app).** The gauge, the stat tiles and the decision feed are live against Calibration. The `LIVE · CALIBRATION` badge is correct on the first painted frame, because the mode is resolved server-side.
 2. **Watch it decide with nobody touching it.** The cycle is driven by [`.github/workflows/agent-tick.yml`](.github/workflows/agent-tick.yml), every 5 minutes, calling `POST /api/tick` with the deployment's shared secret. Leave the page open, hands off; decisions appear on their own. Nothing you do in the browser can cause a tick unless you hold the secret — which is a *stronger* demonstration than the local one, where opening the dashboard is what starts the loop.
-3. **Force a decision.** The real account has ~2,970 days of runway burning about a day per day, so no threshold fires on its own inside a demo. `SQUEEZE RUNWAY` in the OPERATOR group withdraws USDFC from Filecoin Pay back to the agent's own wallet — a **real** withdrawal, so `runwayInEpochs` genuinely collapses and the agent's next tick has a true crisis to answer. It creates no `Decision`, adds nothing to the deposits tile, and pins a disclosure saying a human caused it. The autonomy on show is the response, not the squeeze. Both operator controls are inert until someone pastes `CRON_SECRET` into the page; that secret is never in the client bundle, never in the HTML and never stored.
+3. **Force a decision.** The real account has ~2,970 days of runway burning about a day per day, so no threshold fires on its own inside a demo. `SQUEEZE RUNWAY` in the OPERATOR group withdraws USDFC from Filecoin Pay back to the agent's own wallet — a **real** withdrawal, so `runwayInEpochs` genuinely collapses and the agent's next tick has a true crisis to answer. It creates no `Decision`, adds nothing to the deposits tile, and pins a disclosure saying a human caused it. The autonomy on show is the response, not the squeeze. Both operator controls are inert until someone pastes `CRON_SECRET` into the page; that secret is never in the client bundle, never in the HTML and never stored. The secret and the exact click-path are in [**Drive the demo yourself**](#drive-the-demo-yourself).
 4. **Read the decision log.** `npm run decisions -- --remote` after `vercel env pull .env.local`. Same parser, same scoping, same `--id` view as the local reader.
 5. **Read `src/lib/policy.ts`.** It is 368 lines, pure, and 43 tests across `policy.test.ts` and `policyProof.test.ts` pin its behaviour.
 
@@ -100,7 +137,7 @@ A rule may only ask for `TOP_UP`, `EMERGENCY_TOP_UP` or `HOLD` — `PolicyAction
 | `TOP_UP` | Runway below 7 days. Deposits 5 USDFC. | **Yes** |
 | `EMERGENCY_TOP_UP` | Runway below 2 days. Deposits 15 USDFC. | **Yes** |
 | `INSUFFICIENT_FUNDS` | The rule fired and the wallet cannot cover it. The engine states the shortfall and the fix instead of submitting a transaction guaranteed to revert (`src/lib/policy.ts:337`). | No |
-| `SAFETY_CAP` | The wallet *could* cover it, but the agent has already made 3 deposits or spent 20 USDFC inside its own rolling 24h window. It declined itself (`src/lib/agent.ts:92`). Amber, not red: one needs an operator, the other needs nobody. | No |
+| `SAFETY_CAP` | The wallet *could* cover it, but the agent has already made 3 deposits or spent 20 USDFC inside its own rolling 24h window. It declined itself (`src/lib/agent.ts:98`). Amber, not red: one needs an operator, the other needs nobody. | No |
 | `PRUNE_DATASET` | A rule fired **and** a data set was read to be live, past its PDP proving deadline, and unproven. Terminating its payment rail is a better use of a short runway than buying more of it (`src/lib/policy.ts:245`). | Only if armed — see below |
 
 **PDP proof state is a decision input, not decoration.** Before each decision the agent reads five contract fields per data set — `PDPVerifier.dataSetLive`, `getDataSetLastProvenEpoch`, `getNextChallengeEpoch`, `WarmStorageStateView.provenThisPeriod`, `provingDeadline` — and folds them into one judgement (`classifyProofState()`, `src/lib/proof.ts:93`). The invariant is absolute: **an unread field is never evidence of a missed proof.** A revert or a timeout arrives as an absence, `readable` is false unless all three decisive fields returned, and `isDelinquent` is false whenever `readable` is false. A thirty-second RPC wobble must not cause the agent to cut live, healthy, paid-for storage.
@@ -144,6 +181,7 @@ Full rule table, every reasoning variant, and the card taxonomy: [**deep dive §
     |    spendGuard.ts  rolling 24h deposit cap ............PURE  |
     |    eviction.ts    may a PRUNE be submitted? ..........PURE  |
     |    squeeze.ts     operator withdrawal bounds .........PURE  |
+    |    squeezeGuard.ts rolling 24h withdrawal cap ........PURE  |
     |    deployment.ts  driver: interval | cron                   |
     |    store.ts       ring buffer + SSE pub/sub                 |
     |      +-> journal.ts      append-only JSONL on disk (local)  |
@@ -164,7 +202,7 @@ Full rule table, every reasoning variant, and the card taxonomy: [**deep dive §
   (Vercel Cron = backstop)  +------------------------------------+
 ```
 
-Nothing above `src/lib/chain/` imports the Synapse SDK or can see a private key. The whole product is written against `RunwaySnapshot` and `Decision` in `src/lib/types.ts`, which is why the same dashboard and the same policy engine run unchanged against a simulated chain and a live one — and why the parts a judge is most likely to be suspicious of are the parts that are easiest to test. `evaluate()` is `(RunwaySnapshot, PolicyRule[]) -> Decision`: no clock read unless you inject one, no chain call, no side effect. **471 tests across 25 files**, no network and no key required.
+Nothing above `src/lib/chain/` imports the Synapse SDK or can see a private key. The whole product is written against `RunwaySnapshot` and `Decision` in `src/lib/types.ts`, which is why the same dashboard and the same policy engine run unchanged against a simulated chain and a live one — and why the parts a judge is most likely to be suspicious of are the parts that are easiest to test. `evaluate()` is `(RunwaySnapshot, PolicyRule[]) -> Decision`: no clock read unless you inject one, no chain call, no side effect. **532 tests across 27 files**, no network and no key required.
 
 One tick, in order (`src/lib/agent.ts`):
 
@@ -228,7 +266,7 @@ Use a **fresh Calibration testnet key you do not care about**; it is a hot key i
 Set `FILRUNWAY_DEMO_SCALE` **and** `NEXT_PUBLIC_FILRUNWAY_DEMO_SCALE` to the same value (`480` on the reference account — see below). Leave `FILRUNWAY_DECISION_LOG` unset so each mode keeps its own journal.
 
 ```bash
-npm run test        # 471 tests, 25 files
+npm run test        # 532 tests, 27 files
 npm run typecheck
 npm run lint
 npm run build
@@ -248,7 +286,7 @@ Full environment reference, the complete CLI surface, the Vercel deploy runbook 
 | Stored data and the cost stream being managed | **Real.** `storage.prepare()` then `storage.upload()`, two copies through Warm Storage and PDP. The cost stream exists because real data sits under a real data set. |
 | PDP proof state | **Real.** Five direct contract reads per data set, issued as one `multicall({ allowFailure: true })` and decoded so a revert or timeout arrives as an absence, never as a zero. |
 | Data-set termination | **Real, and gated off by default.** `WarmStorageService.terminateService`, submitted only with `FILRUNWAY_ENABLE_EVICTION=on`. With it off the decision is made, recorded and displayed; nothing is submitted. |
-| The operator squeeze | **Real, and a human's action.** `payments.withdraw` behind `CRON_SECRET` and a hard ceiling. Creates no `Decision`, adds nothing to the deposits tile, pins a disclosure saying an operator caused it. |
+| The operator squeeze | **Real, and a human's action.** `payments.withdraw` behind `CRON_SECRET`, a per-call ceiling and a rolling 24h budget counted from the durable journal. Creates no `Decision`, adds nothing to the deposits tile, pins a disclosure saying an operator caused it. |
 | Contract addresses | **Real.** Read from the chain definition at runtime (`synapse.chain.contracts`), never hardcoded. |
 | Decision history | **Real and durable.** Append-only JSONL, stamped MOCK/LIVE per line, rehydrated scoped to the running mode. On disk locally; in Vercel Blob on the deployment, through the same parser. |
 | The spending cap | **Real,** and enforced against real money: at most 3 deposits and 20 USDFC per rolling 24h, counted from the durable journal. LIVE only. |

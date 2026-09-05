@@ -687,3 +687,68 @@ describe("access detection", () => {
     expect(journal.resolvedAccess.known).toBe(false);
   });
 });
+
+describe("BlobDecisionJournal and operator withdrawals", () => {
+  const squeeze = (id: string, at: number, amountUsdfc = "1") => ({
+    id,
+    at,
+    amountUsdfc,
+    txHash: `0x${id}`,
+  });
+
+  it("appends a squeeze into its own segment and reads it back apart from decisions", async () => {
+    const store = new FakeBlobStore();
+    const journal = journalFor(store, "LIVE", "aaaa", 1_000);
+
+    journal.append(decision("d1", 10));
+    journal.appendSqueeze(squeeze("sqz_1", 20));
+    await journal.flush();
+
+    expect(store.lines()).toHaveLength(2);
+    const loaded = journal.load();
+    expect(loaded.decisions.map((d) => d.id)).toEqual(["d1"]);
+    expect(loaded.squeezes.map((s) => s.id)).toEqual(["sqz_1"]);
+    // An operator action must never reach the decision totals.
+    expect(loaded.totals.decisions).toBe(1);
+    expect(loaded.skipped).toBe(0);
+  });
+
+  it("survives another instance writing, which is the whole reason it is durable", async () => {
+    // The deployed failure mode this guards: two Function instances, each with
+    // its own memory, both able to withdraw. Neither may lose the other's line.
+    const store = new FakeBlobStore();
+    const first = journalFor(store, "LIVE", "aaaa", 1_000);
+    const second = journalFor(store, "LIVE", "bbbb", 2_000);
+
+    first.appendSqueeze(squeeze("sqz_1", 10));
+    second.appendSqueeze(squeeze("sqz_2", 20));
+    await Promise.all([first.flush(), second.flush()]);
+
+    const loaded = await first.loadAsync();
+    expect(loaded.squeezes.map((s) => s.id).sort()).toEqual(["sqz_1", "sqz_2"]);
+  });
+
+  it("stamps the mode, so a MOCK withdrawal cannot count against a LIVE cap", async () => {
+    const store = new FakeBlobStore();
+    const live = journalFor(store, "LIVE", "aaaa", 1_000);
+    const mock = journalFor(store, "MOCK", "bbbb", 2_000);
+
+    live.appendSqueeze(squeeze("sqz_live", 10));
+    mock.appendSqueeze(squeeze("sqz_mock", 20));
+    await Promise.all([live.flush(), mock.flush()]);
+
+    expect((await live.loadAsync()).squeezes.map((s) => s.id)).toEqual(["sqz_live"]);
+    expect((await mock.loadAsync()).squeezes.map((s) => s.id)).toEqual(["sqz_mock"]);
+  });
+
+  it("stays quiet once disabled, exactly as append does", async () => {
+    const store = new FakeBlobStore();
+    store.failWith = new Error("store suspended");
+    const journal = journalFor(store, "LIVE", "aaaa", 1_000);
+
+    expect(() => journal.appendSqueeze(squeeze("sqz_1", 10))).not.toThrow();
+    await journal.flush();
+    expect(journal.enabled).toBe(false);
+    expect(() => journal.appendSqueeze(squeeze("sqz_2", 20))).not.toThrow();
+  });
+});

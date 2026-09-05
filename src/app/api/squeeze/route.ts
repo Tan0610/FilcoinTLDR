@@ -57,6 +57,24 @@ export const dynamic = "force-dynamic";
  * POST only. Unlike the tick there is no scheduler that needs a GET, and a
  * GET that withdraws funds is a link that drains a wallet when something
  * prefetches it.
+ *
+ * AND BEHIND A ROLLING BUDGET
+ * ---------------------------
+ * Authentication answers "who may call this". It does not answer "how often",
+ * and the two are different questions the moment the operator secret is
+ * published in the README so judges can drive the live demo themselves. Nothing
+ * can be stolen through this endpoint — a withdrawal moves USDFC from Filecoin
+ * Pay to the agent's own wallet, both ends the same account — but a caller
+ * looping it would walk the balance to nothing, exhaust the agent's own daily
+ * deposit allowance answering, and leave a public dashboard showing a true
+ * reading of a dead agent.
+ *
+ * So there is a second bound: at most N withdrawals and M USDFC per rolling
+ * 24h, counted from the durable journal, with a reserve floor under the
+ * unlocked balance. Reaching it answers 429 with a body naming the limit, what
+ * has been used, and when it relaxes — never a generic error, because a judge
+ * has to be able to tell a spent budget from a broken deployment. See
+ * `src/lib/squeezeGuard.ts`.
  */
 export async function POST(request: Request): Promise<Response> {
   // Authorise FIRST, before the agent loop starts or a chain adapter opens, so

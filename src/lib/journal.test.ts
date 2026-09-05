@@ -705,3 +705,105 @@ describe("store disclosures", () => {
     expect(published[1].type === "notices" && published[1].notices).toHaveLength(2);
   });
 });
+
+/* ---------- operator withdrawals ---------- */
+
+describe("operator squeeze records", () => {
+  const squeeze = (id = "sqz_1", at = 1_756_000_000_000, amountUsdfc = "1") => ({
+    id,
+    at,
+    amountUsdfc,
+    txHash: `0x${id}`,
+  });
+
+  it("writes a squeeze into the same file and the same sequence as a decision", () => {
+    // One ordered history of everything that happened to this account. Reading
+    // a withdrawal in its true place among the decisions is what makes "the
+    // operator caused this, the agent answered it" checkable months later.
+    const j = journal();
+    j.append(decision());
+    j.appendSqueeze!(squeeze());
+    j.append(decision({ id: "dec-2" }));
+
+    const lines = readFileSync(j.path!, "utf8").trim().split("\n");
+    expect(lines).toHaveLength(3);
+    const parsed = lines.map((line) => JSON.parse(line) as { seq: number; kind?: string });
+    expect(parsed.map((r) => r.seq)).toEqual([1, 2, 3]);
+    expect(parsed.map((r) => r.kind)).toEqual([undefined, "squeeze", undefined]);
+  });
+
+  it("reads them back separately from decisions, and never among them", () => {
+    const j = journal();
+    j.append(decision());
+    j.appendSqueeze!(squeeze());
+
+    const load = j.load();
+    expect(load.decisions).toHaveLength(1);
+    expect(load.squeezes).toEqual([squeeze()]);
+    // The disclosure counts and the totals are about DECISIONS. A withdrawal
+    // entering either of them would put an operator action into the evidence.
+    expect(load.byMode).toEqual({ MOCK: 1, LIVE: 0 });
+    expect(load.totals.decisions).toBe(1);
+  });
+
+  it("does NOT count a squeeze line as corruption", () => {
+    // The line is well-formed and deliberate. Counting it as skipped would have
+    // the dashboard reporting unreadable records that do not exist.
+    const j = journal();
+    j.appendSqueeze!(squeeze());
+    expect(j.load().skipped).toBe(0);
+    expect(j.load().read).toBe(1);
+  });
+
+  it("scopes them by mode, exactly as it scopes decisions", () => {
+    const live = createJournal({ FILRUNWAY_DECISION_LOG: file, FILRUNWAY_MODE: "live" });
+    const mock = createJournal({ FILRUNWAY_DECISION_LOG: file });
+    live.appendSqueeze!(squeeze("sqz_live"));
+    mock.appendSqueeze!(squeeze("sqz_mock"));
+
+    expect(live.load().squeezes.map((s) => s.id)).toEqual(["sqz_live"]);
+    expect(mock.load().squeezes.map((s) => s.id)).toEqual(["sqz_mock"]);
+    expect(live.load(null).squeezes).toHaveLength(2);
+  });
+
+  it("keeps the last record for a repeated id, and orders newest first", () => {
+    const j = journal();
+    j.appendSqueeze!(squeeze("sqz_1", 1_000, "1"));
+    j.appendSqueeze!(squeeze("sqz_1", 1_000, "2"));
+    j.appendSqueeze!(squeeze("sqz_2", 2_000, "3"));
+
+    const loaded = j.load().squeezes;
+    expect(loaded.map((s) => s.id)).toEqual(["sqz_2", "sqz_1"]);
+    expect(loaded.at(-1)?.amountUsdfc).toBe("2");
+  });
+
+  it("rejects a squeeze line that is missing the fields the cap needs", () => {
+    writeFileSync(
+      file,
+      `${JSON.stringify({ v: 1, kind: "squeeze", seq: 1, mode: "MOCK", squeeze: { id: "" } })}\n`,
+      "utf8",
+    );
+    const load = parseJournal(readFileSync(file, "utf8"));
+    expect(load.squeezes).toEqual([]);
+    expect(load.skipped).toBe(1);
+  });
+
+  it("loads an old file, with no squeeze lines at all, as having none", () => {
+    const j = journal();
+    j.append(decision());
+    expect(j.load().squeezes).toEqual([]);
+    expect(emptyLoad().squeezes).toEqual([]);
+  });
+
+  it("surfaces them through readJournalFiles, so the ops CLI sees them too", () => {
+    const j = journal();
+    j.appendSqueeze!(squeeze());
+    expect(readJournalFiles([file], null).squeezes).toEqual([squeeze()]);
+  });
+
+  it("is a no-op on a journal with persistence switched off", () => {
+    const off = nullJournal("LIVE");
+    expect(() => off.appendSqueeze!(squeeze())).not.toThrow();
+    expect(off.load().squeezes).toEqual([]);
+  });
+});

@@ -118,7 +118,7 @@ FilRunway is an autonomous agent that reads its own onchain balance and runway o
 
 **Meaningful Filecoin use (20%).** Synapse SDK 1.2.1 on Calibration. `payments.fund()` for real deposits, `storage.prepare()` and `storage.upload()` through Warm Storage and PDP for the real cost stream being managed, and PDPVerifier reads via `@filoz/synapse-core` for the data sets behind it.
 
-**Clarity (15%).** README with an explicit "where the decision happens" table, a line-by-line breakdown of which on-screen numbers are raw chain readings and which are client-side interpolation, and an honest real-versus-simulated split. The decision journal is mode-scoped end to end: live and mock write separate files, every read is scoped to the running mode, and the "transactions the agent authored" listing hard-filters to live-with-a-hash at every scope, so a simulated hash cannot be presented as evidence. On the deployment that journal is append-only Blob segments, readable from anywhere with `npm run decisions -- --remote`. 471 unit tests across 25 files.
+**Clarity (15%).** README with an explicit "where the decision happens" table, a line-by-line breakdown of which on-screen numbers are raw chain readings and which are client-side interpolation, and an honest real-versus-simulated split. The decision journal is mode-scoped end to end: live and mock write separate files, every read is scoped to the running mode, and the "transactions the agent authored" listing hard-filters to live-with-a-hash at every scope, so a simulated hash cannot be presented as evidence. On the deployment that journal is append-only Blob segments, readable from anywhere with `npm run decisions -- --remote`. 532 unit tests across 27 files.
 
 ---
 

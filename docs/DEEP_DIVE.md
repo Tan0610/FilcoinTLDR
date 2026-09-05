@@ -47,7 +47,7 @@ npm run decisions -- --split       # move historical MOCK records out of the LIV
 npm run decisions -- --split --write   # actually apply that copy
 ```
 
-`scripts/decisions.ts` needs **no private key and no running server**. In its default form it reads the local JSONL files and needs no network either. `--remote` points it at the deployed agent's Blob journal instead (`readBlobJournal()`, `src/lib/blobJournal.ts:661`) and needs only `BLOB_READ_WRITE_TOKEN`, which `vercel env pull .env.local` writes — still no private key, still no server. Every other flag behaves identically against either source, because both go through the same parser and the same mode scoping.
+`scripts/decisions.ts` needs **no private key and no running server**. In its default form it reads the local JSONL files and needs no network either. `--remote` points it at the deployed agent's Blob journal instead (`readBlobJournal()`, `src/lib/blobJournal.ts:684`) and needs only `BLOB_READ_WRITE_TOKEN`, which `vercel env pull .env.local` writes — still no private key, still no server. Every other flag behaves identically against either source, because both go through the same parser and the same mode scoping.
 
 The bare form ends with a `transactions the agent authored` block that pairs every tx hash with its Filfox URL, the id of the decision that authored it, and the exact command to expand that decision.
 
@@ -105,7 +105,7 @@ A MOCK decision is a real record of a real decision, but its transaction hash wa
 
 ### 2.1 Writes go to separate files by default
 
-With `FILRUNWAY_DECISION_LOG` unset, the path is derived from `FILRUNWAY_MODE` (`journalPathFor()`, `src/lib/journal.ts:529`):
+With `FILRUNWAY_DECISION_LOG` unset, the path is derived from `FILRUNWAY_MODE` (`journalPathFor()`, `src/lib/journal.ts:708`):
 
 | `FILRUNWAY_MODE` | Journal file | |
 |---|---|---|
@@ -118,9 +118,9 @@ Both are gitignored.
 
 ### 2.2 Reads are scoped to the running mode
 
-`FileDecisionJournal.load()` (`src/lib/journal.ts:459`) defaults its scope to the journal's own mode, so a LIVE server replaying a file that also holds MOCK lines gets its own history back and nothing else. The Blob journal behaves identically: it concatenates its segments and hands the text to the same `parseJournal()` (`BlobDecisionJournal.load()`, `src/lib/blobJournal.ts:452`), so mode stamping, scoping, the `byMode` counts and the withheld-records disclosure are unchanged when the bytes move off disk.
+`FileDecisionJournal.load()` (`src/lib/journal.ts:614`) defaults its scope to the journal's own mode, so a LIVE server replaying a file that also holds MOCK lines gets its own history back and nothing else. The Blob journal behaves identically: it concatenates its segments and hands the text to the same `parseJournal()` (`BlobDecisionJournal.load()`, `src/lib/blobJournal.ts:454`), so mode stamping, scoping, the `byMode` counts and the withheld-records disclosure are unchanged when the bytes move off disk.
 
-Crucially, a record whose `mode` field is missing or unrecognised reads as **MOCK** (`recordMode()`, `src/lib/journal.ts:308`): downgrading an unknown line is the only safe default, because a line must never be promoted into evidence by being unreadable. What the scope leaves out is counted (`byMode`) and disclosed rather than silently dropped.
+Crucially, a record whose `mode` field is missing or unrecognised reads as **MOCK** (`recordMode()`, `src/lib/journal.ts:423`): downgrading an unknown line is the only safe default, because a line must never be promoted into evidence by being unreadable. What the scope leaves out is counted (`byMode`) and disclosed rather than silently dropped.
 
 ### 2.3 The dashboard shows one mode and says which
 
@@ -134,7 +134,7 @@ The AUTONOMOUS DEPOSITS tile and the decision feed are both fed from that scoped
 
 MOCK is marked in three independent places — the first word of the label, the hazard-yellow accent, and the leading `MOCK ·` of the sub-line — so no crop of a screenshot can hide it. The figure itself is never altered: it is a true count of simulated activity, not a fake count of real activity.
 
-The AGENT TRACE says the same thing in words on startup (`AgentStore.hydrate()`, `src/lib/store.ts:166`, or `hydrateAsync()` at line 175 for a journal whose records have to be fetched). The restore line reads:
+The AGENT TRACE says the same thing in words on startup (`AgentStore.hydrate()`, `src/lib/store.ts:183`, or `hydrateAsync()` at line 192 for a journal whose records have to be fetched). The restore line reads:
 
 ```
 Restored 1481 LIVE decisions from D:\Filecoin_TLDR\data\decisions.jsonl (1 executed,
@@ -146,31 +146,32 @@ That second sentence is the point. An omission a viewer cannot see is indistingu
 
 ### 2.4 The disclosure outlives the trace line
 
-That restore line is an ordinary log event, and the trace it lands in is a rolling tail. Within minutes of boot it has scrolled away, and a judge opening the dashboard an hour later would have seen nothing. So the fact it carries is held separately, as state. `discloseOmissions()` (`src/lib/store.ts:313`) raises it as an `AgentNotice` — a key, a level and a message, and nothing else (`src/lib/types.ts:256`):
+That restore line is an ordinary log event, and the trace it lands in is a rolling tail. Within minutes of boot it has scrolled away, and a judge opening the dashboard an hour later would have seen nothing. So the fact it carries is held separately, as state. `discloseOmissions()` (`src/lib/store.ts:336`) raises it as an `AgentNotice` — a key, a level and a message, and nothing else (`src/lib/types.ts:256`):
 
 ```
 12 MOCK decisions in D:\Filecoin_TLDR\data\decisions.jsonl are withheld from this LIVE
 view. Read them with `npm run decisions -- --mode mock`.
 ```
 
-The same facts as the restore line, said again where they cannot expire. `addNotice()` (`src/lib/store.ts:349`) is idempotent by key and republishes the *whole* current set whenever it grows, and `/api/stream` sends that whole set on every connect *after* the backlog, so an older copy still sitting in the tail can never overwrite the authoritative one (`src/app/api/stream/route.ts`). The client replaces its copy rather than appending to it — `newerNotices()` (`src/lib/decisions.ts:104`) returns the existing array untouched when nothing is newer, so a reconnect restates the disclosure without re-rendering the row. It draws as a `PINNED` row above the rolling AGENT TRACE list, coloured by level (`src/components/Dashboard.tsx`).
+The same facts as the restore line, said again where they cannot expire. `addNotice()` (`src/lib/store.ts:372`) is idempotent by key and republishes the *whole* current set whenever it grows, and `/api/stream` sends that whole set on every connect *after* the backlog, so an older copy still sitting in the tail can never overwrite the authoritative one (`src/app/api/stream/route.ts`). The client replaces its copy rather than appending to it — `newerNotices()` (`src/lib/decisions.ts:104`) returns the existing array untouched when nothing is newer, so a reconnect restates the disclosure without re-rendering the row. It draws as a `PINNED` row above the rolling AGENT TRACE list, coloured by level (`src/components/Dashboard.tsx`).
 
 Ten disclosures ride that channel, and each is raised behind an explicit conditional:
 
 | Key | Raised when | Where |
 |---|---|---|
-| `journal-withheld` | the scope hid records of the other mode | `src/lib/store.ts:318` |
-| `journal-skipped` | unreadable lines were skipped | `src/lib/store.ts:331` |
-| `journal-unreadable` | the journal could not be read at all | `src/lib/store.ts:230` |
-| `journal-write-failed` | a journal write failed mid-session | `src/lib/store.ts:443` |
-| `journal-off` | persistence is switched off entirely | `src/lib/agent.ts:811` |
-| `demo-scale-mismatch` | `FILRUNWAY_DEMO_SCALE` disagrees with its `NEXT_PUBLIC_` twin | `src/lib/agent.ts:833` |
-| `driver-cron` | the cycle is driven by a scheduled call to `/api/tick` | `src/lib/agent.ts:847` |
-| `spend-cap` | the rolling deposit cap is actually in force | `src/lib/agent.ts:795` |
-| `eviction-armed` | `FILRUNWAY_ENABLE_EVICTION` is on, so a prune may execute | `src/lib/agent.ts:802` |
-| `operator-squeeze` | a human has withdrawn funds in this session | `src/lib/agent.ts:691` |
+| `journal-withheld` | the scope hid records of the other mode | `src/lib/store.ts:342` |
+| `journal-skipped` | unreadable lines were skipped | `src/lib/store.ts:355` |
+| `journal-unreadable` | the journal could not be read at all | `src/lib/store.ts:247` |
+| `journal-write-failed` | a journal write failed mid-session | `src/lib/store.ts:466` |
+| `journal-off` | persistence is switched off entirely | `src/lib/agent.ts:909` |
+| `demo-scale-mismatch` | `FILRUNWAY_DEMO_SCALE` disagrees with its `NEXT_PUBLIC_` twin | `src/lib/agent.ts:931` |
+| `driver-cron` | the cycle is driven by a scheduled call to `/api/tick` | `src/lib/agent.ts:945` |
+| `spend-cap` | the rolling deposit cap is actually in force | `src/lib/agent.ts:884` |
+| `squeeze-cap` | the rolling operator-withdrawal cap is actually in force | `src/lib/agent.ts:892` |
+| `eviction-armed` | `FILRUNWAY_ENABLE_EVICTION` is on, so a prune may execute | `src/lib/agent.ts:899` |
+| `operator-squeeze` | a human has withdrawn funds in this session | `src/lib/agent.ts:768` |
 
-The set starts empty, so a clean load in a single-mode journal pins nothing. **Nothing withheld means no notice at all**, which is the whole reason a pinned row is worth believing: it is only ever there because it is true. Claiming a limit that is not being enforced would be worse than silence, which is why `spend-cap` and `eviction-armed` are conditional on the capability actually being armed rather than merely configured.
+The set starts empty, so a clean load in a single-mode journal pins nothing. **Nothing withheld means no notice at all**, which is the whole reason a pinned row is worth believing: it is only ever there because it is true. Claiming a limit that is not being enforced would be worse than silence, which is why `spend-cap`, `squeeze-cap` and `eviction-armed` are conditional on the capability actually being armed rather than merely configured.
 
 ### 2.5 What `--mode` can and cannot widen
 
@@ -229,10 +230,10 @@ On Vercel there is no such process. `src/lib/blobJournal.ts` rebuilds the same a
 - **Per-writer segments.** Every writer gets its own object keys, `filrunway/journal/<mode>/<startedAt>-<instance>-<part>.jsonl`, so there is never a read-modify-write of a shared object and two Function instances ticking at the same moment cannot lose each other's lines.
 - **Sealed at 50 lines.** A segment stops being appended to once it reaches its cap and the writer opens the next `part`, which bounds how much has to be re-uploaded per append.
 - **Read is list-then-concatenate.** A read lists the whole prefix, fetches the segments, joins the text and hands it to the same `parseJournal()` the file journal uses. Mode scoping, `byMode` counts and the withheld-records disclosure are therefore identical on both storage backends.
-- **`journalPath` is prefixed `blob:`** (`src/lib/blobJournal.ts:412`) so nobody reads it as a file on a disk that does not exist — and it is **null** whenever the journal is not writing, with the reason in the adjacent `journalError`, so a dead journal cannot report a location as though it were live.
-- **`selectJournal()`** (`src/lib/blobJournal.ts:774`) picks disk or Blob from the environment.
+- **`journalPath` is prefixed `blob:`** (`src/lib/blobJournal.ts:413`) so nobody reads it as a file on a disk that does not exist — and it is **null** whenever the journal is not writing, with the reason in the adjacent `journalError`, so a dead journal cannot report a location as though it were live.
+- **`selectJournal()`** (`src/lib/blobJournal.ts:797`) picks disk or Blob from the environment.
 
-`flushJournal()` (`src/lib/store.ts:460`, awaited by `runTick()` at `src/lib/agent.ts:377`) means a tick does not return until its record is actually durable. A Function instance can be frozen the instant it responds, and a queued journal write at that moment is a transaction with no evidence behind it.
+`flushJournal()` (`src/lib/store.ts:483`, awaited by `runTick()` at `src/lib/agent.ts:383`) means a tick does not return until its record is actually durable. A Function instance can be frozen the instant it responds, and a queued journal write at that moment is a transaction with no evidence behind it.
 
 ---
 
@@ -269,6 +270,11 @@ On Vercel there is no such process. `src/lib/blobJournal.ts` rebuilds the same a
         |        +--> src/lib/spendGuard.ts  checkSpend() PURE, 20 t.   |
         |        |         the agent's own rolling 24h deposit cap;     |
         |        |         a refusal becomes a SAFETY_CAP decision      |
+        |        |                                                     |
+        |        +--> src/lib/squeezeGuard.ts checkSqueezeCap() PURE  |
+        |        |         the OPERATOR's rolling 24h withdrawal cap    |
+        |        |         + reserve floor; a refusal is a 429, never   |
+        |        |         a decision — nobody decided anything         |
         |        |                                                     |
         |        +--> src/lib/eviction.ts    may a PRUNE be submitted?  |
         |        |         off unless FILRUNWAY_ENABLE_EVICTION=on      |
@@ -324,6 +330,7 @@ Two more modules exist because the agent can do something irreversible, and beca
 | `src/lib/proof.ts` | **Is this data set actually earning its cost?** Pure. Turns five PDP/Warm Storage reads into one judgement, and refuses to call an unread field a missed proof. |
 | `src/lib/eviction.ts` | **May a `PRUNE_DATASET` decision reach the chain?** Off unless `FILRUNWAY_ENABLE_EVICTION` is exactly `on` / `1` / `true` / `yes`. |
 | `src/lib/squeeze.ts` | **How much may an operator withdraw to create a crisis?** Pure bounds-checking behind `POST /api/squeeze`. |
+| `src/lib/squeezeGuard.ts` | **How often, and down to what floor?** A rolling 24-hour withdrawal cap on the operator control, counted from the durable journal — the mirror image of `spendGuard.ts`. |
 
 ### 3.2 API surface
 
@@ -333,8 +340,8 @@ Two more modules exist because the agent can do something irreversible, and beca
 | `GET /api/decisions?limit=N` | `{ decisions: Decision[], status: AgentStatus }` |
 | `GET /api/storage` | `{ storage: StorageListing, status: AgentStatus }`, or **503** with `{ error }` when the chain read fails. The gauge and decision feed do not depend on it, so it is allowed to fail alone rather than take the dashboard down. |
 | `POST /api/tick` <br> `GET /api/tick` | `{ decision: Decision, status: AgentStatus, coalesced: boolean }`. `coalesced: true` means a cycle was already in flight and this decision was **not** taken for this request. It can spend, so under the cron driver both verbs require `Authorization: Bearer $CRON_SECRET` (or `x-filrunway-tick-secret`) and answer **401** without it, **503** when the deployment has no secret configured at all (`authorizeTick()`, `src/lib/tickAuth.ts:252`; `requiresTickAuth()`, line 153). `GET` exists because that is the verb a scheduler uses; `POST` stays the operator's. Both run the identical handler — there is no unauthenticated back door on either. |
-| `POST /api/squeeze` | `{ amountUsdfc, txHash, explorerUrl, before, after }`. The operator's forced-decision control: withdraws USDFC from Filecoin Pay back to the agent's wallet. **POST only** — a GET that withdraws funds is a link that drains a wallet when something prefetches it. Same secret and same constant-time comparison as the tick, demanded on a **stricter** rule: `requiresSqueezeAuth()` (`src/lib/tickAuth.ts:158`) demands it whenever the adapter is LIVE, on every host and under every driver. See [§7](#7-the-operator-squeeze). |
-| `GET /api/stream` | SSE: `snapshot`, `decision`, `tx`, `log`, `totals`, `notices`. The backlog replays first (`store.backlog()`, `src/lib/store.ts:542`), then the whole current disclosure set. |
+| `POST /api/squeeze` | `{ amountUsdfc, txHash, explorerUrl, before, after }`. The operator's forced-decision control: withdraws USDFC from Filecoin Pay back to the agent's wallet. **POST only** — a GET that withdraws funds is a link that drains a wallet when something prefetches it. Same secret and same constant-time comparison as the tick, demanded on a **stricter** rule: `requiresSqueezeAuth()` (`src/lib/tickAuth.ts:158`) demands it whenever the adapter is LIVE, on every host and under every driver. Behind a second bound as well: at most 6 withdrawals and 8 USDFC per rolling 24h with a 1 USDFC unlocked reserve, counted from the durable journal — a refusal is a **429** naming the limit and when it relaxes, and produces no `Decision`. See [§7](#7-the-operator-squeeze). |
+| `GET /api/stream` | SSE: `snapshot`, `decision`, `tx`, `log`, `totals`, `notices`. The backlog replays first (`store.backlog()`, `src/lib/store.ts:622`), then the whole current disclosure set. |
 
 `AgentStatus` carries `mode`, `address`, `tickIntervalMs`, `lastTickAt`, `nextTickAt`, plus `totals` (whole-history aggregates from the journal, **scoped to `mode`**), `journalPath` (where this mode's record is kept, or `null` when persistence is off or has disabled itself) and `notices` (the standing disclosures, oldest first, empty when there is nothing to disclose). `GET /api/decisions` serves the store's ring, which was hydrated under the same scope, so the feed a browser receives is single-mode by construction.
 
@@ -348,10 +355,10 @@ The cycle is the same everywhere. What **drives** it is chosen from the environm
 
 | Driver | Where | What starts the cycle | Interval |
 |---|---|---|---|
-| `interval` | `next dev`, `next start`, any long-lived process | `ensureAgentLoop()` (`src/lib/agent.ts:780`) sets two `setInterval` timers on the first API request, lazily, so nothing schedules work during `next build`. | sense 2s (`SENSE_INTERVAL_MS`), tick 15s (`TICK_INTERVAL_MS`) |
-| `cron` | Vercel | **Nothing in this process.** `ensureAgentLoop()` starts no timer and takes no tick (it returns at `src/lib/agent.ts:854`); an external scheduler calls `/api/tick` instead, authenticated with `CRON_SECRET` — here, [`.github/workflows/agent-tick.yml`](../.github/workflows/agent-tick.yml) every 5 minutes, with the daily Vercel Cron Job in `vercel.ts` as a backstop. | tick 60s default, overridden to 300s by `FILRUNWAY_CRON_INTERVAL_MS` |
+| `interval` | `next dev`, `next start`, any long-lived process | `ensureAgentLoop()` (`src/lib/agent.ts:869`) sets two `setInterval` timers on the first API request, lazily, so nothing schedules work during `next build`. | sense 2s (`SENSE_INTERVAL_MS`), tick 15s (`TICK_INTERVAL_MS`) |
+| `cron` | Vercel | **Nothing in this process.** `ensureAgentLoop()` starts no timer and takes no tick (it returns at `src/lib/agent.ts:939`); an external scheduler calls `/api/tick` instead, authenticated with `CRON_SECRET` — here, [`.github/workflows/agent-tick.yml`](../.github/workflows/agent-tick.yml) every 5 minutes, with the daily Vercel Cron Job in `vercel.ts` as a backstop. | tick 60s default, overridden to 300s by `FILRUNWAY_CRON_INTERVAL_MS` |
 
-That second row is the whole point of the split, and the reason it is a hard branch rather than a fallback. A Function exists for the length of one request, so a timer set inside it either never fires or fires on an instance nobody is looking at — and the *immediate* first tick the local loop performs (`src/lib/agent.ts:867`) would mean that merely **reading the dashboard** could cause the agent to spend. Under the cron driver no route may start a cycle as a side effect of being read.
+That second row is the whole point of the split, and the reason it is a hard branch rather than a fallback. A Function exists for the length of one request, so a timer set inside it either never fires or fires on an instance nobody is looking at — and the *immediate* first tick the local loop performs (`src/lib/agent.ts:964`) would mean that merely **reading the dashboard** could cause the agent to spend. Under the cron driver no route may start a cycle as a side effect of being read.
 
 One tick, in order:
 
@@ -432,7 +439,7 @@ One tick, in order:
                                   no evidence behind it.
 ```
 
-Only one cycle runs at a time. A tick that arrives mid-cycle does not start a second one and does not silently re-serve an older decision: the response carries `coalesced: true`, so a caller can tell that the decision it got back was not taken for its request (`runTick()`, `src/lib/agent.ts:352`, guard at line 357).
+Only one cycle runs at a time. A tick that arrives mid-cycle does not start a second one and does not silently re-serve an older decision: the response carries `coalesced: true`, so a caller can tell that the decision it got back was not taken for its request (`runTick()`, `src/lib/agent.ts:358`, guard at line 361).
 
 Steps 7 to 10 matter as much as step 11. HOLD, SAFETY_CAP, INSUFFICIENT_FUNDS and a withheld PRUNE_DATASET are all still decisions: each is recorded with full reasoning and rendered as its own card in the decision log. An agent that only logs when it acts, or that submits a transaction it already knows will fail, is not showing you its judgement.
 
@@ -468,7 +475,7 @@ A rule can only ever ask for `TOP_UP`, `EMERGENCY_TOP_UP` or `HOLD` — `PolicyA
 | Conclusion | Where it is decided | When |
 |---|---|---|
 | `INSUFFICIENT_FUNDS` | `evaluate()`, `src/lib/policy.ts:337`. Pure. | The rule that fired wants a deposit larger than the wallet holds. The engine reports the shortfall instead of returning the rule's action. |
-| `SAFETY_CAP` | `applySpendCap()`, `src/lib/agent.ts:92`. Deliberately **outside** `policy.ts`. | The wallet could cover it, but the agent has already made 3 deposits, or deposited 20 USDFC, inside the rolling 24-hour window. |
+| `SAFETY_CAP` | `applySpendCap()`, `src/lib/agent.ts:98`. Deliberately **outside** `policy.ts`. | The wallet could cover it, but the agent has already made 3 deposits, or deposited 20 USDFC, inside the rolling 24-hour window. |
 | `PRUNE_DATASET` | `evaluate()`, the eviction branch at `src/lib/policy.ts:245`. Pure — it is *told* whether execution is armed. | A rule has fired **and** a data set has been read to be live, past its proving deadline and unproven. Cutting it beats buying runway to keep paying for it. See [§6](#6-pdp-proof-state-and-data-set-eviction). |
 
 `SAFETY_CAP` lives outside the policy engine for a reason worth stating: `evaluate()` is pure, and answering *"how much have I spent in the last 24 hours?"* needs the durable history that only the store has. Keeping the impure question out of the pure function is what lets the policy stay trivially testable. The same argument is why `evaluate()` is *handed* `evictionEnabled` as an explicit input (`EvaluateOptions.evictionEnabled`, `src/lib/policy.ts:97`) rather than reading `process.env` itself; it defaults to `false`, so a caller that forgets it gets the safe answer.
@@ -584,7 +591,7 @@ The re-sizing arithmetic is stated as a bound rather than a measurement, and lab
 
 So execution is gated on `FILRUNWAY_ENABLE_EVICTION`, which is **off** unless the value is exactly `on`, `1`, `true` or `yes` (`evictionEnabled()`, `src/lib/eviction.ts:45`). Anything else — unset, empty, `off`, a typo — is off. A destructive capability must never be enabled by a value nobody meant.
 
-The gate is checked **twice**: once in the policy engine, which is told the answer as an explicit input so it stays pure, and again in the agent runner immediately before the call (`applyEvictionGate()`, `src/lib/agent.ts:126`). A decision that says EXECUTE and an environment that says no results in nothing being submitted.
+The gate is checked **twice**: once in the policy engine, which is told the answer as an explicit input so it stays pure, and again in the agent runner immediately before the call (`applyEvictionGate()`, `src/lib/agent.ts:132`). A decision that says EXECUTE and an environment that says no results in nothing being submitted.
 
 **With the gate off — the default, and what you want for a demo — the agent still MAKES the decision.** It records it, with its target, its reading and its full reasoning, in the durable journal, and the outcome says plainly that execution is disabled and which variable enables it (`evictionDisabledNote()`, `src/lib/eviction.ts:55`):
 
@@ -596,7 +603,7 @@ When the capability *is* armed, a `eviction-armed` notice is pinned to the dashb
 
 ### 6.5 Execution, when armed
 
-`executePrune()` (`src/lib/agent.ts:564`) submits `WarmStorageService.terminateService` directly on chain (`src/lib/chain/synapse.ts:686`), waits for the receipt, and then **invalidates the storage cache** (`invalidateStorageCache()`, `src/lib/agent.ts:207`, called at line 620). Left alone, the cached listing would still show the cut data set as live, the next tick would read it, judge it delinquent again, and decide to terminate a rail it has already terminated.
+`executePrune()` (`src/lib/agent.ts:570`) submits `WarmStorageService.terminateService` directly on chain (`src/lib/chain/synapse.ts:686`), waits for the receipt, and then **invalidates the storage cache** (`invalidateStorageCache()`, `src/lib/agent.ts:213`, called at line 626). Left alone, the cached listing would still show the cut data set as live, the next tick would read it, judge it delinquent again, and decide to terminate a rail it has already terminated.
 
 The SDK offers two termination paths and the direct one is used deliberately: `StorageManager.terminateService` is provider-relayed and refuses outright when the provider cannot be reached, whereas `WarmStorageService.terminateService` is one transaction the agent signs itself (`src/lib/chain/synapse.ts:660`).
 
@@ -622,16 +629,16 @@ The honest fix is not to fake a crisis but to **cause** one. `payments.withdraw`
 
 ### 7.1 Whose action it is
 
-The operator's. This is the one control on the dashboard that a human uses to manufacture the situation the agent then responds to, and everything about it is built so it can never be read as the agent acting (`squeezeRunway()`, `src/lib/agent.ts:659`):
+The operator's. This is the one control on the dashboard that a human uses to manufacture the situation the agent then responds to, and everything about it is built so it can never be read as the agent acting (`squeezeRunway()`, `src/lib/agent.ts:695`):
 
 - it produces **no `Decision`** and touches no rule, so nothing it does can land in the decision log or the deposits tile;
 - its trace lines are prefixed `OPERATOR ACTION`;
-- it pins an `operator-squeeze` disclosure the moment it is first used (`src/lib/agent.ts:691`), idempotent by key, so a viewer arriving later can still tell that the crisis on screen was manufactured: *"An OPERATOR has withdrawn USDFC from Filecoin Pay to the agent wallet in this session, deliberately shortening the runway so the policy engine has a real crisis to answer. The withdrawal is a human action; the decisions that follow it are the agent's."*
+- it pins an `operator-squeeze` disclosure the moment it is first used (`src/lib/agent.ts:768`), idempotent by key, so a viewer arriving later can still tell that the crisis on screen was manufactured: *"An OPERATOR has withdrawn USDFC from Filecoin Pay to the agent wallet in this session, deliberately shortening the runway so the policy engine has a real crisis to answer. The withdrawal is a human action; the decisions that follow it are the agent's."*
 - it waits for confirmation before returning, because an unconfirmed withdrawal leaves the runway unchanged and a demo would read as broken.
 
 The autonomy on show is the response, not the squeeze.
 
-### 7.2 Why it is bounded
+### 7.2 Why it is bounded per call
 
 It moves money from a funded wallet, so it is behind the same shared secret as `/api/tick` **and** behind a ceiling. `planSqueeze()` (`src/lib/squeeze.ts:97`) is pure — the caller supplies the request, the account's unlocked balance and the bounds — and every refusal names the number that caused it, so a 400 from this endpoint tells an operator what to change:
 
@@ -643,7 +650,7 @@ It moves money from a funded wallet, so it is behind the same shared secret as `
 | Filecoin Pay reports no unlocked funds | the runway is already at its floor |
 | would leave the account in debt | `> fundsAvailable`, refused outright rather than clamped |
 
-That last one is refused rather than clamped on purpose: an operator who asked for 5 and silently got 0.31 would misread the runway that followed. The reading it is checked against is a **fresh** `sense()` (`src/lib/agent.ts:674`), not the cached one, so the bound reflects the balance the withdrawal actually runs from.
+That last one is refused rather than clamped on purpose: an operator who asked for 5 and silently got 0.31 would misread the runway that followed. The reading it is checked against is a **fresh** `sense()` (`src/lib/agent.ts:710`), not the cached one, so the bound reflects the balance the withdrawal actually runs from.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -652,13 +659,57 @@ That last one is refused rather than clamped on purpose: an operator who asked f
 
 Set the default to whatever actually collapses the runway of the account in question; `npm run bootstrap -- status` prints the balance to size it from. A malformed value never throws — it falls back to the default (`squeezeLimits()`, `src/lib/squeeze.ts:77`).
 
-### 7.3 Authentication, and why it is stricter than the tick's
+### 7.3 The rolling withdrawal cap
+
+The per-call bounds answer *how much*. They said nothing about *how often*, and that stopped being an academic gap the moment `CRON_SECRET` was published in the README so judges could drive the live demo themselves.
+
+Be precise about the threat, because it is not theft. A withdrawal moves USDFC from Filecoin Pay to the agent's **own** wallet; both ends are the same account and there is no address a caller can redirect it to. What a loop against the endpoint would do is walk `availableFunds` down, exhaust the agent's own 3-deposit daily allowance answering the crises, and leave a public dashboard showing a true, permanent reading of a dead agent. The numbers would stay honest. There would be nothing left worth reading.
+
+So withdrawals get a rolling budget of their own, mirroring §8's spending cap in shape, in wording and in how it is counted (`src/lib/squeezeGuard.ts`):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `FILRUNWAY_MAX_SQUEEZES_24H` | `6` | Withdrawals allowed inside the window. |
+| `FILRUNWAY_MAX_SQUEEZE_USDFC_24H` | `8` | Total USDFC allowed out inside the window. |
+| `FILRUNWAY_SQUEEZE_WINDOW_MS` | `86400000` | Length of the rolling window. |
+| `FILRUNWAY_SQUEEZE_RESERVE_USDFC` | `1` | USDFC that must remain unlocked after any withdrawal. |
+| `FILRUNWAY_SQUEEZE_CAP` | unset | `on` / `off` forces the cap regardless of mode. |
+
+**Where those defaults come from.** They are fitted to the demo they have to allow and anchored to the cap in §8. On the deployed account a healthy runway is ~3,966 days against a 3,360-day top-up threshold, and it takes about 2 USDFC of withdrawal to cross that — one crisis-and-recovery cycle, answered by one 5 USDFC top-up. 8 USDFC per 24h is therefore three full cycles (6 USDFC) with headroom for one mis-sized attempt, and no fourth; 6 squeezes is the same three cycles at the 1 USDFC default amount, where a cycle takes two presses. Neither number was chosen freely: `FILRUNWAY_MAX_DEPOSITS_24H` is 3, so the agent can only demonstrate recovery three times in a window anyway, and a wider withdrawal budget would buy nothing except a stretch of dashboard with a flat, unanswerable crisis on it. The ceiling is also deliberately **strictly below** what the agent may restore over the same window — 8 USDFC out against 3 × 5 = 15 USDFC in — so a fully exercised demo day cannot leave Filecoin Pay lower than it started.
+
+**A floor as well as a rate.** A rate cap alone still permits three well-sized withdrawals that between them empty the account, so `reserveUsdfc` refuses any withdrawal that would leave less than 1 USDFC unlocked. Two other floors were considered:
+
+- **Locked funds** need nothing here and never did. `planSqueeze()` already bounds every request against `RunwaySnapshot.fundsAvailable`, which *is* Filecoin Pay's `availableFunds` — the portion not locked against commitments. Lockup is unreachable from this endpoint whatever the cap is set to.
+- **A runway-threshold floor** — "refuse anything that would take the runway below the emergency threshold" — was **rejected**. `EMERGENCY_TOP_UP` is a real capability the agent has, and a floor that forbade the runway from ever reaching it would make the one policy branch nobody could ever demonstrate the one that matters most. The floor sits on the balance instead: 1 USDFC is ~125 days at the ×480 timescale, well inside the 960-day emergency threshold and safely above zero.
+
+**How the count is made durable.** Same answer as §8, and the same reason: on Vercel consecutive calls land on different Function instances, and a limit held in process memory resets whenever one is recycled. But a squeeze produces no `Decision` — that is the point of §7.1 — so there was nothing in the journal to count.
+
+The fix is a second **record kind** in the same append-only journal. A confirmed withdrawal is written as an `OperatorSqueeze` line carrying `"kind":"squeeze"` (`src/lib/journal.ts`), beside the decisions and explicitly not among them:
+
+```json
+{"v":1,"kind":"squeeze","seq":13,"writtenAt":1756800000000,"mode":"LIVE",
+ "squeeze":{"id":"sqz_…","at":1756800000000,"amountUsdfc":"1","txHash":"0x…"}}
+```
+
+It shares the file, the sequence, the MOCK/LIVE stamping, the mode-scoped reads and — on the deployment — the same append-only Blob segments, so two instances squeezing at once cannot lose each other's records. It is kept out of everything else by construction: `JournalLoad.squeezes` is a separate list from `JournalLoad.decisions`, `byMode` and `totals` count decisions only, and nothing in the decision feed or the AUTONOMOUS DEPOSITS tile reads it. Reusing the journal rather than building a second store is deliberate — the durability, concurrency and mode-scoping properties are the ones this project already argued for at length, and a withdrawal ledger with weaker ones would be the weakest link in the cap.
+
+**Counting, and what does not count.** The slot is taken *before* the transaction is submitted and released again if the withdrawal is refused by the chain or never confirms — the deposit cap's rule in reverse. Taking it up front matters here in a way it does not for deposits: a loop against a published secret runs inside one instance and is far faster than a chain round trip, so a counter that only moved on confirmation would let a dozen withdrawals start before the first one landed. Only confirmed withdrawals reach the journal, which is what keeps the durable record and the cap's arithmetic identical.
+
+**What a refusal looks like.** Not a generic error. The reason string is built in `checkSqueezeCap()`, so the wording is identical wherever it fires and is asserted in tests rather than eyeballed in a screenshot:
+
+> Refused by the operator withdrawal cap: 6 of a maximum 6 squeezes already made in the last 24h (6.00 USDFC withdrawn). No transaction was attempted and no funds moved. The cap relaxes as the oldest withdrawal ages out at 2026-09-05 14:12:07 UTC. The agent is unharmed and still ticking. Raise `FILRUNWAY_MAX_SQUEEZES_24H` if this demo genuinely needs a wider budget.
+
+A window refusal is **`429`** — *come back later*. A reserve refusal is **`400`** — *ask for less*. They are different instructions and are not collapsed into one status. Either way the message arrives on the dashboard through the operator strip's existing feedback line, which already renders `ApiError.error` verbatim (`onSqueeze`, `src/components/Dashboard.tsx`), and the limits themselves are pinned as a standing `squeeze-cap` notice at startup, so a judge who arrives after someone else spent the budget can still see that it is bounded on purpose.
+
+**It never touches what the agent decides.** The cap lives on the operator's side of the line drawn in §7.1: hitting it refuses an HTTP request. Unlike §8's `SAFETY_CAP` it records no decision, because nobody decided anything — a human was told no.
+
+### 7.4 Authentication, and why it is stricter than the tick's
 
 Same secret (`CRON_SECRET`), same constant-time comparison, same fail-closed 503 when a deployment has none configured. One secret and one comparison means one place to get it wrong.
 
 The **threshold** for demanding it is not the same, and the difference is the worst case behind each endpoint. `/api/tick` is open locally because the worst an unauthenticated local tick can do is run, a few seconds early, the cycle that was going to run anyway: the agent decides, and anything it spends is capped and is a deposit *into* its own Filecoin Pay account. This endpoint's worst case is money leaving that account, in an amount the caller chose. So `authorizeSqueeze()` (`src/lib/tickAuth.ts:268`, via `requiresSqueezeAuth()` at line 174) demands the secret whenever the chain adapter is LIVE — whatever the driver, whatever the host — and only leaves the door open for a local MOCK run, where there are no funds to take. A `next dev` in LIVE mode is a funded wallet on a listening port, and "it is only localhost" is not a boundary the handler can verify.
 
-### 7.4 Where the secret lives
+### 7.5 Where the secret lives
 
 **Not in the browser bundle.** Next.js only inlines `NEXT_PUBLIC_*`, and nothing in `src/components/OperatorControls.tsx` reads one. A human pastes the secret into an input on the page; it is held in that one component's React state and sent as the `x-filrunway-tick-secret` request header. It reaches exactly one origin — this app's own — and it is gone the moment the page unloads.
 
@@ -666,7 +717,7 @@ Deliberately **not** persisted to `sessionStorage` or `localStorage`. Keeping it
 
 The control is a two-step arm-then-confirm inside its own bordered group labelled OPERATOR, with an explicit caption and a result line that says what a human just did. `operatorAuthRequired()` (`src/lib/tickAuth.ts:148`) is resolved **server-side** in `src/app/page.tsx` and handed to the client, so the controls render in the right state on the first painted frame instead of offering a button that turns out to 401. When it is false — local development, where the endpoints are open — the secret input is not rendered at all.
 
-### 7.5 Why the controls exist on the deployment at all
+### 7.6 Why the controls exist on the deployment at all
 
 `manualTickEnabled()` (`src/lib/deployment.ts:116`) returns `true` everywhere. It used to be `agentDriver(env) === "interval"`, i.e. locally only, on a sound argument: `/api/tick` requires a shared secret on a deployment, and a button could only send that secret by carrying it, which would publish it to every visitor of a public URL holding a funded wallet key.
 
@@ -693,12 +744,12 @@ Four properties worth checking rather than taking on trust:
 
 - **It is enforced in LIVE only** (`spendCapEnabled()`, `src/lib/spendGuard.ts:127`). In MOCK nothing can be spent, and a mock run ticks every 15 seconds, so a conservative daily cap would fire within minutes and change the local demo into something it is not. `FILRUNWAY_SPEND_CAP=on` turns it on anyway.
 - **Hitting it is a decision, not an error.** `checkSpend()` (`src/lib/spendGuard.ts:180`) is pure — the caller supplies the history, the clock and the limits — and its refusal text is built there so the wording is identical wherever the cap fires and can be asserted in a test rather than eyeballed in a screenshot. `applySpendCap()` turns that refusal into a `SAFETY_CAP` decision with `outcome: NO_ACTION`, journalled like any other.
-- **The window is counted from the durable journal, not from process memory** (`spendEntriesFrom()`, `src/lib/spendGuard.ts:243`, seeded into the store on every hydrate and refresh at `src/lib/store.ts:246`). On Vercel each tick may run on a different Function instance, and a cap that resets whenever an instance is recycled is not a cap.
-- **A deposit counts once it has EXECUTED, for the amount the rule asked for** — the same definition `accumulate()` totals in `journal.ts`, routed through `isDepositAction()`, so the cap and the AUTONOMOUS DEPOSITS tile can never disagree about what was spent. A submitted transaction that then fails to confirm is released again (`releaseSpend()`, `src/lib/store.ts:489`, called from `src/lib/agent.ts:527`).
+- **The window is counted from the durable journal, not from process memory** (`spendEntriesFrom()`, `src/lib/spendGuard.ts:243`, seeded into the store on every hydrate and refresh at `src/lib/store.ts:263`). On Vercel each tick may run on a different Function instance, and a cap that resets whenever an instance is recycled is not a cap.
+- **A deposit counts once it has EXECUTED, for the amount the rule asked for** — the same definition `accumulate()` totals in `journal.ts`, routed through `isDepositAction()`, so the cap and the AUTONOMOUS DEPOSITS tile can never disagree about what was spent. A submitted transaction that then fails to confirm is released again (`releaseSpend()`, `src/lib/store.ts:512`, called from `src/lib/agent.ts:533`).
 
 While the cap is in force the agent pins a standing disclosure stating the limits, so a viewer who arrives after a `CAPPED` card can still see what limit it was that fired: *"Safety cap in force: at most 3 deposits and 20.00 USDFC per 24h. Reaching it records a declining decision; it never transacts."*
 
-**One honest limit on the guarantee.** Across Function instances the cap is eventually consistent, not transactionally exact. Each instance seeds its window from the shared journal and re-reads it on a 3-second TTL (`REFRESH_TTL_MS`, `src/lib/store.ts:60`), so two ticks landing on two instances inside the same 3-second window could each believe the other's deposit had not happened. At one tick every five minutes — the deployed schedule — that race is not reachable, and inside a single instance the cap is exact because a deposit is counted the moment it reaches the chain (`src/lib/agent.ts:493`). But it is a refresh window, not a lock, and this project would rather say so than let it be discovered.
+**One honest limit on the guarantee.** Across Function instances the cap is eventually consistent, not transactionally exact. Each instance seeds its window from the shared journal and re-reads it on a 3-second TTL (`REFRESH_TTL_MS`, `src/lib/store.ts:62`), so two ticks landing on two instances inside the same 3-second window could each believe the other's deposit had not happened. At one tick every five minutes — the deployed schedule — that race is not reachable, and inside a single instance the cap is exact because a deposit is counted the moment it reaches the chain (`src/lib/agent.ts:499`). But it is a refresh window, not a lock, and this project would rather say so than let it be discovered.
 
 ---
 
@@ -771,11 +822,11 @@ When scaling is active the UI and the audit trail say so in three independent pl
 2. Every rule label — including HOLD's, which carries no suffix of its own — is suffixed `×480 DEMO` and shows the *effective* (scaled) day figure next to its comparison operator, not the base one. At `×480` a card reads `SCHEDULED TOP-UP < 3,360d ×480 DEMO` or `HOLD >= 3,360d ×480 DEMO`, never the unscaled `< 7d` / `>= 7d`. This is `ruleLabel()` (`src/lib/format.ts:146`): a normal rule's threshold was already multiplied by `scaleRules()` upstream, while HOLD — the policy's catch-all rule, whose threshold is a `Number.MAX_SAFE_INTEGER` sentinel that must never be multiplied — has its figure substituted with `DEMO_BAND_WARNING_DAYS`, the same scaled top-up threshold, and gets the `×N DEMO` suffix appended explicitly, so all three decision cards read alike.
 3. Every decision's `reasoning` ends with its own disclosure sentence, e.g. `Threshold shown is the 7-day rule at the ×480 demo timescale.` (`demoScaleNote()`, `src/lib/demo.ts:149`). This matters because a decision card is routinely screenshotted with the gauge header out of frame; without it, "below the 3360-day top-up threshold" would carry no hint that 3,360 is 7 × 480. At scale 1 the sentence is the empty string and nothing is added anywhere.
 
-The agent also logs a warning line into the trace on startup whenever a timescale is in force. Unlike the journal disclosures, that banner deliberately stays an ordinary trace line rather than a durable `AgentNotice` — `src/lib/agent.ts:821` calls `log()`, not `notice()`, because the three places just listed already state the scale permanently and a late-arriving viewer cannot miss it. Durability is spent only where the fact would otherwise be unobtainable.
+The agent also logs a warning line into the trace on startup whenever a timescale is in force. Unlike the journal disclosures, that banner deliberately stays an ordinary trace line rather than a durable `AgentNotice` — `src/lib/agent.ts:920` calls `log()`, not `notice()`, because the three places just listed already state the scale permanently and a late-arriving viewer cannot miss it. Durability is spent only where the fact would otherwise be unobtainable.
 
 One thing the disclosures do **not** promise: that every card in the feed quotes the same scale. A card restored from the journal shows the threshold and suffix recorded with it, so a feed containing history from an earlier run at a different scale will show both. Each card is individually correct about the decision it describes. The `×380 DEMO` labels visible on older *mock* decision cards are not a contradiction and are not the current configuration: a restored card carries the rule label captured when that decision was taken, so it reports the scale in force at the time, which for that mock session was 380. See [limitation 9](#13-known-limitations-in-full).
 
-One configuration trap, and the agent catches it for you: the gauge is a client component, and Next.js only inlines `NEXT_PUBLIC_*` into the browser bundle. Setting only the server-side `FILRUNWAY_DEMO_SCALE` makes the agent act on scaled thresholds while the gauge still draws a 14-day axis. `ensureAgentLoop()` compares the two raw values (`demoScaleAgreement()`, `src/lib/demo.ts:224`) and pins a `demo-scale-mismatch` **error** notice saying exactly which scale each half resolved (`src/lib/agent.ts:833`). Set both.
+One configuration trap, and the agent catches it for you: the gauge is a client component, and Next.js only inlines `NEXT_PUBLIC_*` into the browser bundle. Setting only the server-side `FILRUNWAY_DEMO_SCALE` makes the agent act on scaled thresholds while the gauge still draws a 14-day axis. `ensureAgentLoop()` compares the two raw values (`demoScaleAgreement()`, `src/lib/demo.ts:224`) and pins a `demo-scale-mismatch` **error** notice saying exactly which scale each half resolved (`src/lib/agent.ts:931`). Set both.
 
 ---
 
@@ -831,6 +882,11 @@ Next.js loads both `.env` and `.env.local` (and never commits either — see `.g
 | `FILRUNWAY_ENABLE_EVICTION` | unset (off) | Permits a `PRUNE_DATASET` decision to actually submit `terminateService`. On only for exactly `on` / `1` / `true` / `yes`. **Irreversible.** With it off the decision is still made and recorded. |
 | `FILRUNWAY_SQUEEZE_USDFC` | `1` | Withdrawn by `POST /api/squeeze` when the caller names no amount. |
 | `FILRUNWAY_MAX_SQUEEZE_USDFC` | `5` | Hard ceiling on a single squeeze. |
+| `FILRUNWAY_MAX_SQUEEZES_24H` | `6` | Squeezes an operator may make inside the rolling window. |
+| `FILRUNWAY_MAX_SQUEEZE_USDFC_24H` | `8` | Total USDFC an operator may withdraw inside that window. Deliberately below the 15 USDFC the agent may deposit back over the same window. |
+| `FILRUNWAY_SQUEEZE_WINDOW_MS` | `86400000` | Length of the withdrawal window. |
+| `FILRUNWAY_SQUEEZE_RESERVE_USDFC` | `1` | USDFC that must remain unlocked in Filecoin Pay after any withdrawal. |
+| `FILRUNWAY_SQUEEZE_CAP` | unset | `on` / `off`, forcing the withdrawal cap regardless of mode. Unset, it is enforced in LIVE and not in MOCK. |
 | `FILRUNWAY_MOCK_PROOF` | `healthy` | Mock only. `healthy` / `delinquent` / `unreadable` — which proof story the mock adapter's second data set tells. |
 | `FILRUNWAY_MOCK_EPOCHS_PER_SECOND` | `120` | Mock only. Chain-time acceleration; 120 means one real second is about one hour of chain time. |
 
@@ -876,7 +932,7 @@ npm run bootstrap -- datasets                      list data sets and total stor
 `npx tsx scripts/bootstrap.ts <command>` is equivalent if you would rather skip the npm indirection.
 
 ```bash
-npm run test         # 471 unit tests, 25 files
+npm run test         # 532 unit tests, 27 files
 npm run typecheck
 npm run lint
 ```
@@ -947,7 +1003,7 @@ Step 3 is the one people skip. `BLOB_READ_WRITE_TOKEN` is **injected by the plat
 
 Everything in [§10.5](#105-the-full-environment-reference) still applies. The ones that only matter deployed are `CRON_SECRET`, `BLOB_READ_WRITE_TOKEN`, `FILRUNWAY_CRON_INTERVAL_MS`, `FILRUNWAY_AGENT_DRIVER`, `FILRUNWAY_REQUIRE_TICK_AUTH`, `FILRUNWAY_BLOB_PREFIX` and `FILRUNWAY_BLOB_ACCESS`, plus the four spend-cap variables and the two squeeze bounds.
 
-**`FILRUNWAY_DECISION_LOG`: do not set it on Vercel.** It names a filesystem path, and a Function's filesystem is read-only apart from an ephemeral `/tmp`. On a deployment with a Blob store connected, `selectJournal()` (`src/lib/blobJournal.ts:774`) honours exactly one value of it — `off`, which disables persistence entirely — and ignores any path, because a path there would be either an error or a `/tmp` file discarded with the instance. Setting it to `off` on a deployment means the agent's decisions leave no record at all, which is the one thing this project's autonomy claim cannot survive. Leave it unset.
+**`FILRUNWAY_DECISION_LOG`: do not set it on Vercel.** It names a filesystem path, and a Function's filesystem is read-only apart from an ephemeral `/tmp`. On a deployment with a Blob store connected, `selectJournal()` (`src/lib/blobJournal.ts:797`) honours exactly one value of it — `off`, which disables persistence entirely — and ignores any path, because a path there would be either an error or a `/tmp` file discarded with the instance. Setting it to `off` on a deployment means the agent's decisions leave no record at all, which is the one thing this project's autonomy claim cannot survive. Leave it unset.
 
 ### 11.4 Public and private Blob stores
 
@@ -1066,7 +1122,7 @@ Everything here is a real difference a viewer can notice. None of it is hidden b
 | The cost stream being managed | Real. It exists because real data sits under a real data set. |
 | PDP proof state | Real. Five direct contract reads per data set — `PDPVerifier.dataSetLive`, `getDataSetLastProvenEpoch`, `getNextChallengeEpoch`, `WarmStorageStateView.provenThisPeriod`, `provingDeadline` — issued as one `multicall({ allowFailure: true })` and decoded so a revert or timeout arrives as an **absence**, never as a zero. |
 | Data-set termination | Real, and **gated off by default**. `WarmStorageService.terminateService`, submitted only when `FILRUNWAY_ENABLE_EVICTION` is explicitly on. With it off the decision is still made, recorded and displayed; nothing is submitted and no data is touched. |
-| The operator squeeze | Real, and **a human's action, not the agent's**. `synapse.payments.withdraw({ amount })` behind `CRON_SECRET` and a hard ceiling. It creates no `Decision`, adds nothing to the deposits tile, and pins a disclosure saying an operator caused the crisis on screen. |
+| The operator squeeze | Real, and **a human's action, not the agent's**. `synapse.payments.withdraw({ amount })` behind `CRON_SECRET`, a per-call ceiling, and a rolling 24h budget (6 squeezes / 8 USDFC, with a 1 USDFC unlocked reserve) counted from the durable journal. It creates no `Decision`, adds nothing to the deposits tile, and pins a disclosure saying an operator caused the crisis on screen. |
 | Contract addresses | Read from the chain definition at runtime (`synapse.chain.contracts`), never hardcoded. |
 | Policy thresholds and gauge graduations | **Scaled** by `FILRUNWAY_DEMO_SCALE`. See [§9](#9-the-demo-timescale). |
 | STORED DATA panel | Real. `ChainAdapter.listStorage()` reads the account's Warm Storage data sets, providers, sizes and active piece CIDs from the chain. Served by `/api/storage`; a failed read is a 503 the panel prints, never a placeholder row. |
@@ -1112,13 +1168,13 @@ Ordered roughly by how much they would matter in production.
 
 3. **The post-prune re-sizing is a bound, not a measurement.** Filecoin Pay reports one aggregate `lockupRatePerEpoch` for the account with no per-rail split, so the burn rate that survives a termination is not readable in advance. `resizeTopUp()` divides pro-rata by rail *count*, the reasoning says so in those words, and the next reading re-decides against the true figure. It is stated rather than hidden, but it is still arithmetic standing in for a measurement.
 
-4. **The local journal is single-writer; the deployed one is not, but neither is a database.** Decisions themselves are durable: every decision, and every later status transition of it, is appended to a JSON Lines record that `src/lib/store.ts` rehydrates on start. Locally that is `appendFileSync` from one single-threaded process, so two servers sharing one path would interleave and each would need its own `FILRUNWAY_DECISION_LOG`. (Two servers in *different* modes already get different files by default, so this is only a hazard for two servers in the same mode.) On Vercel that constraint is genuinely solved rather than inherited: `src/lib/blobJournal.ts` gives every writer its own segment objects, sealed at 50 lines, so there is no read-modify-write of a shared object and two Function instances ticking at the same moment cannot lose each other's lines. What is still *not* solved anywhere is querying and indexing — a read lists the whole prefix and concatenates it. The in-memory ring in front of it is still capped (200 decisions, 400 events), which bounds what the UI holds and nothing else; anything that ages out of the ring is folded into the server-side `totals` rather than lost. `store.backlog()` (`src/lib/store.ts:542`) is documented in code as a rolling tail that nothing durable may depend on, and the startup disclosures are exempt from aging out precisely because they travel as `notices` state rather than as backlog content. A journal that cannot be written disables itself with a warning and the agent carries on in memory, so a storage problem degrades the record rather than stopping the agent. It is an append-only evidence log, not a database.
+4. **The local journal is single-writer; the deployed one is not, but neither is a database.** Decisions themselves are durable: every decision, and every later status transition of it, is appended to a JSON Lines record that `src/lib/store.ts` rehydrates on start. Locally that is `appendFileSync` from one single-threaded process, so two servers sharing one path would interleave and each would need its own `FILRUNWAY_DECISION_LOG`. (Two servers in *different* modes already get different files by default, so this is only a hazard for two servers in the same mode.) On Vercel that constraint is genuinely solved rather than inherited: `src/lib/blobJournal.ts` gives every writer its own segment objects, sealed at 50 lines, so there is no read-modify-write of a shared object and two Function instances ticking at the same moment cannot lose each other's lines. What is still *not* solved anywhere is querying and indexing — a read lists the whole prefix and concatenates it. The in-memory ring in front of it is still capped (200 decisions, 400 events), which bounds what the UI holds and nothing else; anything that ages out of the ring is folded into the server-side `totals` rather than lost. `store.backlog()` (`src/lib/store.ts:622`) is documented in code as a rolling tail that nothing durable may depend on, and the startup disclosures are exempt from aging out precisely because they travel as `notices` state rather than as backlog content. A journal that cannot be written disables itself with a warning and the agent carries on in memory, so a storage problem degrades the record rather than stopping the agent. It is an append-only evidence log, not a database.
 
 5. **Two drivers, and only one of them is a timer.** `agentDriver()` (`src/lib/deployment.ts:73`) reads Vercel's own `VERCEL=1` marker and picks: `interval`, where `ensureAgentLoop()` starts `setInterval` timers from a route handler and a long-lived process owns them, or `cron`, where it starts **nothing** and an external scheduler calls `/api/tick` instead. The local timer is correct for `next dev` and `next start` and meaningless on a Function that lives for one request, so the deployed build does not pretend otherwise — and, importantly, under the cron driver no route may start a cycle as a side effect of being read, so merely opening the dashboard cannot make the agent spend. The residual limitation is that the two paths are genuinely different code: the cron path is covered by `src/lib/deployment.test.ts`, `src/lib/tickAuth.test.ts`, `src/lib/blobJournal.test.ts` and `src/app/api/tick/route.test.ts`, but a long-running deployment has not been observed for days at a time. See limitation 11.
 
 6. **Hot key in a file.** `FILECOIN_PRIVATE_KEY` sits in `.env` (or `.env.local` — either is loaded). It is confined to two modules and scrubbed out of every error message that escapes them, but it is still a hot key. Testnet only.
 
-7. **No backoff, though there is now a ceiling.** A failed deposit is recorded and retried on the next tick with the same amount, with no exponential backoff and no per-error retry cap. What it can no longer do is retry forever at the agent's own expense: `src/lib/spendGuard.ts` caps successful deposits at 3, and 20 USDFC, per rolling 24 hours in LIVE mode, and a retry that would cross either limit becomes a `SAFETY_CAP` decision instead of a transaction. That is a spend ceiling rather than a circuit breaker — it bounds the money, not the number of attempts, and a *failed* deposit consumes no cap because only EXECUTED decisions are counted. Proper backoff on the failure path is still the right improvement. The squeeze has no equivalent rate limit either: it is bounded per call, not per window.
+7. **No backoff, though there is now a ceiling.** A failed deposit is recorded and retried on the next tick with the same amount, with no exponential backoff and no per-error retry cap. What it can no longer do is retry forever at the agent's own expense: `src/lib/spendGuard.ts` caps successful deposits at 3, and 20 USDFC, per rolling 24 hours in LIVE mode, and a retry that would cross either limit becomes a `SAFETY_CAP` decision instead of a transaction. That is a spend ceiling rather than a circuit breaker — it bounds the money, not the number of attempts, and a *failed* deposit consumes no cap because only EXECUTED decisions are counted. Proper backoff on the failure path is still the right improvement. The squeeze now has an equivalent of its own — `src/lib/squeezeGuard.ts` bounds it per call AND per rolling 24 hours, with a reserve floor under the balance — and it is a budget rather than a circuit breaker in exactly the same way.
 
 8. **`getStoredItems()` in live mode lists only this process's own uploads**, not an onchain enumeration — it is empty on a freshly started server. The onchain answer is `ChainAdapter.listStorage()`, which is what `/api/storage`, the dashboard's STORED DATA panel and the proof reading use; `bootstrap -- datasets` prints the same thing from the CLI.
 
@@ -1126,14 +1182,14 @@ Ordered roughly by how much they would matter in production.
 
 10. **A restored decision card carries the rule label captured when the decision was taken.** This is within-mode staleness, not mode mixing, and it is pre-existing. `ruleLabel()` rewrites the day figure of the *catch-all* HOLD rule from the scale currently in force, but a rule that actually fired (`topup-7d`, `emergency-2d`) was scaled by `scaleRules()` at decision time and carries both its scaled `thresholdDays` and its `×N DEMO` suffix inside the stored `ruleFired.label`. So a mock session recorded at `×380` still displays `×380 DEMO` on its restored cards even when the current session runs at `×480`. That is correct as history — the card says what the agent actually compared against — but it does mean two cards in one feed can quote two different scales. The gauge badge, and every decision's own `reasoning` disclosure sentence, always state the scale that decision was taken at.
 
-11. **Not verified against a long-running live deployment.** 471 unit tests across 25 files cover the pure logic, the journal and its mode scoping, the reader-side mode policy, the live adapter's helpers against the SDK's return shapes, the orchestration in `runTick()` against a scripted adapter, and every deployment-shaped module. What they do not cover is sustained multi-hour live behaviour, real Vercel Cron delivery, cross-instance journal convergence under genuine concurrency, RPC flakiness under load, provider-side upload failures, and an actual armed `terminateService` against a real delinquent data set — none of which have been exercised at length.
+11. **Not verified against a long-running live deployment.** 532 unit tests across 27 files cover the pure logic, the journal and its mode scoping, the reader-side mode policy, the live adapter's helpers against the SDK's return shapes, the orchestration in `runTick()` against a scripted adapter, and every deployment-shaped module. What they do not cover is sustained multi-hour live behaviour, real Vercel Cron delivery, cross-instance journal convergence under genuine concurrency, RPC flakiness under load, provider-side upload failures, and an actual armed `terminateService` against a real delinquent data set — none of which have been exercised at length.
 
 ---
 
 ## 14. Tests
 
 ```bash
-npm run test         # 471 tests across 25 files
+npm run test         # 532 tests across 27 files
 npm run typecheck
 npm run lint
 ```
@@ -1142,27 +1198,29 @@ Per file:
 
 | File | Tests | What it pins |
 |---|---:|---|
-| `src/lib/journal.test.ts` | 44 | Append-only format, per-mode paths, mode-scoped reads, unknown-mode downgrade, totals. |
+| `src/lib/journal.test.ts` | 53 | Append-only format, per-mode paths, mode-scoped reads, unknown-mode downgrade, totals, and the operator-squeeze record kind kept apart from decisions. |
 | `src/lib/tickAuth.test.ts` | 37 | Both header forms, the 401/503 split, the stricter squeeze rule, and that no rejection leaks whether a secret is configured. |
-| `src/lib/blobJournal.test.ts` | 31 | Segmenting, sealing, re-read avoidance, mode scoping, selection, the remote reader, and public/private access resolution on both the write and read paths — against an injected IO fake. No network, no token. |
+| `src/lib/blobJournal.test.ts` | 35 | Segmenting, sealing, re-read avoidance, mode scoping, selection, the remote reader, and public/private access resolution on both the write and read paths — against an injected IO fake. No network, no token. |
+| `src/lib/squeezeGuard.test.ts` | 30 | The operator withdrawal cap: both rolling limits at the boundary and one either side, the reserve floor, the refusal wording, and that a malformed env var widens nothing. |
 | `src/lib/agent.test.ts` | 28 | `runTick()` against a scripted adapter: failed reads, reverting deposits, unconfirmed transactions, concurrent ticks. |
 | `src/lib/demo.test.ts` | 27 | Scaling, the HOLD sentinel, the disclosure sentence, scale agreement. |
 | `src/lib/units.test.ts` | 27 | Decimal-string money maths. No floats anywhere. |
-| `src/lib/policy.test.ts` | 25 | Threshold boundaries, rule ordering, the unbounded-runway sentinel, wallet shortfall, reasoning text. |
 | `src/lib/chain/synapse.test.ts` | 25 | Pure helpers against the SDK's return shapes. |
+| `src/lib/policy.test.ts` | 25 | Threshold boundaries, rule ordering, the unbounded-runway sentinel, wallet shortfall, reasoning text. |
 | `src/lib/format.test.ts` | 21 | Rule labels, tile resolution, action colours. |
 | `src/lib/journalReport.test.ts` | 21 | Reader-side mode policy: what counts as evidence, what a scope is hiding. |
 | `src/lib/proof.test.ts` | 21 | The delinquency judgement, and every branch in which it must refuse to make one. |
-| `src/lib/spendGuard.test.ts` | 20 | Window arithmetic, both limits, the refusal wording, EXECUTED-only accounting. |
 | `src/app/api/squeeze/route.test.ts` | 20 | The withdraw endpoint: auth, POST-only, bounds, and that it produces no `Decision`. |
+| `src/lib/spendGuard.test.ts` | 20 | Window arithmetic, both limits, the refusal wording, EXECUTED-only accounting. |
+| `src/lib/agentSqueezeCap.test.ts` | 18 | The withdrawal cap end-to-end through `squeezeRunway()`: a refused squeeze never reaches `withdraw()`, the window is counted from the durable journal, and a confirmed squeeze is journalled as a squeeze and never as a `Decision`. |
 | `src/lib/decisions.test.ts` | 18 | Client-side decision and notice merging. |
 | `src/lib/policyProof.test.ts` | 18 | The eviction branch of `evaluate()`, including the emergency fallback when eviction is disarmed. |
 | `src/lib/deployment.test.ts` | 12 | The driver decision, including that a typo in the override is ignored rather than trusted. |
 | `src/lib/squeeze.test.ts` | 11 | `planSqueeze()` bounds and every refusal's wording. |
 | `src/lib/agentPrune.test.ts` | 10 | The prune end-to-end through `runTick()`, armed and disarmed. |
 | `src/lib/agentSpendCap.test.ts` | 10 | The cap end-to-end through `runTick()`: a capped tick journals a `SAFETY_CAP` decision and submits nothing. |
-| `src/app/api/tick/route.test.ts` | 9 | 401 without the secret, 503 when none is configured, 200 for both verbs with it, and that authorisation happens before anything else can run. |
 | `src/app/api/stream/route.test.ts` | 9 | The real route handler with a real `Request`: backlog window, frame encoding, connect order. |
+| `src/app/api/tick/route.test.ts` | 9 | 401 without the secret, 503 when none is configured, 200 for both verbs with it, and that authorisation happens before anything else can run. |
 | `src/lib/chain/mock.test.ts` | 8 | The simulated adapter's clock and drain. |
 | `src/lib/chain/proofDecode.test.ts` | 8 | Decoding a partial-failure `multicall` into a `ProofReading` — every revert and timeout must arrive as an absence, never as a zero. |
 | `src/lib/agentSnapshot.test.ts` | 6 | The TTL-gated snapshot read the cron driver uses, including that a failed read falls back to the last true reading rather than a fabricated one. |
@@ -1182,7 +1240,7 @@ Per file:
 | Transport | Server-Sent Events (`/api/stream`), carrying `snapshot`, `decision`, `tx`, `log`, `totals` and `notices` events. No websocket. Locally there is no client polling loop except the STORED DATA panel, which polls `/api/storage` every 30s; on the deployment the dashboard also re-reads `/api/snapshot` and `/api/decisions` every 5s, because the tick and the stream live in different Function instances. |
 | Persistence | Append-only JSON Lines, one stream per adapter mode. On disk locally (`src/lib/journal.ts`); as append-only segment objects in **Vercel Blob** (`@vercel/blob` 2.8, `src/lib/blobJournal.ts`) on Vercel, through the same parser. No database. |
 | Deployment | Vercel. Project config in `vercel.ts`, type-checked against **`@vercel/config`** 0.7. Every value in it is static: a git-source deploy reads that file without evaluating it, so a computed value is dropped and fails schema validation. Cycle driven by a GitHub Actions workflow hitting `POST /api/tick` every 5 minutes, with a daily Vercel Cron Job as backstop; `maxDuration` 300s on the tick, squeeze and stream routes. |
-| Tests | Vitest 4, **471 tests across 25 files** |
+| Tests | Vitest 4, **532 tests across 27 files** |
 | Network | Filecoin Calibration, chain ID 314159, 30s epochs, 2880 epochs/day |
 | Explorer | Filfox, `https://calibration.filfox.info/en/message/<hash>` |
 
@@ -1201,6 +1259,7 @@ A note on the SDK version, because most code samples online are stale: 1.2.1 rem
 | `src/lib/proof.ts` | PDP proof state, and the one judgement the agent is allowed to make from it. Pure and paranoid: an unread field is never evidence of a missed proof. |
 | `src/lib/eviction.ts` | The opt-in that lets a `PRUNE_DATASET` decision actually reach the chain. Off unless someone deliberately turned it on. |
 | `src/lib/squeeze.ts` | Bounds for the operator's SQUEEZE RUNWAY control. Pure. |
+| `src/lib/squeezeGuard.ts` | The operator's rolling 24h withdrawal cap plus a reserve floor. Pure. |
 | `src/lib/agent.ts` | `runTick()`: sense, decide, act. Plus tick coalescing, the storage listing cache, the spend and eviction gates, and `squeezeRunway()` — the one function here that is not the agent acting. |
 | `src/lib/journal.ts` | The durable append-only decision journal. The evidence file. Per-mode paths, mode-scoped reads. |
 | `src/lib/journalReport.ts` | Reader-side mode policy: `--mode` parsing, what counts as evidence, what a scope is hiding. Pure. |

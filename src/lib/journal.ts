@@ -30,6 +30,22 @@
  * `mode` is stamped per record on purpose: a MOCK record must never be
  * mistakable for a LIVE one when the file is read back months later.
  *
+ * TWO KINDS OF LINE
+ * -----------------
+ * Most lines are decisions. A second, rarer kind records an OPERATOR
+ * withdrawal — the `SQUEEZE RUNWAY` control — and carries `"kind":"squeeze"`
+ * plus an `OperatorSqueeze` instead of a `Decision`:
+ *
+ *   {"v":1,"kind":"squeeze","seq":13,"writtenAt":…,"mode":"LIVE",
+ *    "squeeze":{"id":"sqz_…","at":…,"amountUsdfc":"1","txHash":"0x…"}}
+ *
+ * They share the file and the sequence and are kept strictly apart everywhere
+ * else: a squeeze never enters `decisions`, never reaches `totals`, never
+ * appears in the decision feed and never counts towards the AUTONOMOUS DEPOSITS
+ * tile. It is here for one reason — `src/lib/squeezeGuard.ts` caps withdrawals
+ * over a rolling window, and on a serverless host that count has to survive
+ * Function instance churn. See `OperatorSqueeze`.
+ *
  * MODE SEPARATION
  * ---------------
  * Stamping was only half the job. Two things now act on that stamp:
@@ -114,6 +130,44 @@ export interface JournalEntry {
   decision: Decision;
 }
 
+/**
+ * One OPERATOR withdrawal from Filecoin Pay, as recorded durably.
+ *
+ * Deliberately NOT a `Decision`, and deliberately not shaped like one. A
+ * squeeze is a human manufacturing a crisis so the agent has something real to
+ * answer; the agent's response on the following tick is the autonomous part.
+ * Recording it as a decision would put an operator's action into the decision
+ * feed, the AUTONOMOUS DEPOSITS tile and the evidence the whole project rests
+ * on, which is the one confusion this codebase exists to prevent.
+ *
+ * It still has to be DURABLE, for a reason that has nothing to do with
+ * evidence: `src/lib/squeezeGuard.ts` caps withdrawals over a rolling 24h
+ * window, and on a serverless host consecutive calls land on different Function
+ * instances. A cap counted from process memory would reset itself whenever an
+ * instance was recycled. So the squeeze gets its own record kind in the same
+ * append-only journal — beside the decisions, never among them.
+ *
+ * Only CONFIRMED withdrawals are written, which is what keeps the cap's
+ * arithmetic identical to the record's: the same relationship the deposit
+ * totals have with EXECUTED decisions.
+ */
+export interface OperatorSqueeze {
+  /** Stable id for this withdrawal. Re-reading the same line is idempotent. */
+  id: string;
+  /** Wall-clock ms when the operator asked for it. */
+  at: number;
+  /** USDFC withdrawn, decimal string. */
+  amountUsdfc: string;
+  /** The confirmed transaction, when one was recorded. */
+  txHash?: string;
+}
+
+/** One squeeze as it was found on disk, with the mode that produced it. */
+export interface SqueezeJournalEntry {
+  mode: AgentMode;
+  squeeze: OperatorSqueeze;
+}
+
 /** How many distinct decisions a file holds per mode, BEFORE any scoping. */
 export type ModeCounts = Record<AgentMode, number>;
 
@@ -140,12 +194,39 @@ export interface JournalRecord {
   importedAt?: number;
 }
 
+/**
+ * One line recording an OPERATOR withdrawal rather than an agent decision.
+ *
+ * Distinguished by `kind`, which no decision line carries, so the two are told
+ * apart on their own contents rather than by position or by guessing. A reader
+ * that predates this kind sees a line it cannot validate as a decision and
+ * counts it as `skipped`; that is why the field is present and explicit.
+ */
+export interface SqueezeRecord {
+  v: typeof JOURNAL_VERSION;
+  kind: "squeeze";
+  /** Append sequence within this file, 1-based. Shared with decision lines. */
+  seq: number;
+  writtenAt: number;
+  /** Adapter mode that produced it. A MOCK squeeze is not a real withdrawal. */
+  mode: AgentMode;
+  squeeze: OperatorSqueeze;
+}
+
 /** What a load found on disk, after scoping. */
 export interface JournalLoad {
   /** Latest record per decision id IN SCOPE, newest first. */
   decisions: Decision[];
   /** The same list, carrying the mode each decision was recorded in. */
   entries: JournalEntry[];
+  /**
+   * Operator withdrawals IN SCOPE, newest first. Kept strictly apart from
+   * `decisions`: nothing here was decided by the agent, and nothing here is
+   * counted in `totals`. See `OperatorSqueeze`.
+   */
+  squeezes: OperatorSqueeze[];
+  /** The same list, carrying the mode each withdrawal was recorded in. */
+  squeezeEntries: SqueezeJournalEntry[];
   /** Aggregates over every in-scope decision, not just the slice the UI holds. */
   totals: DecisionTotals;
   /** Distinct decisions per mode found in the file, before scoping. */
@@ -174,6 +255,16 @@ export interface DecisionJournal {
   load(scope?: JournalScope): JournalLoad;
   /** Append one record. Never throws. */
   append(decision: Decision): void;
+  /**
+   * Append one OPERATOR withdrawal. Never throws.
+   *
+   * OPTIONAL, like `flush`, so every existing `DecisionJournal` — including the
+   * scripted ones in the test suite — stays a valid implementation. A journal
+   * that does not implement it simply persists no squeeze history, which
+   * degrades the withdrawal cap to per-process exactly as a disabled journal
+   * degrades the spend cap. Both shipped journals implement it.
+   */
+  appendSqueeze?(squeeze: OperatorSqueeze): void;
 
   /* ---------- remote journals only ---------- */
 
@@ -215,6 +306,8 @@ export function emptyLoad(scope: JournalScope = null): JournalLoad {
   return {
     decisions: [],
     entries: [],
+    squeezes: [],
+    squeezeEntries: [],
     totals: emptyTotals(),
     byMode: emptyModeCounts(),
     scope,
@@ -300,19 +393,49 @@ function isJournalRecord(value: unknown): value is JournalRecord {
 }
 
 /**
+ * Structural check for an operator-withdrawal line.
+ *
+ * Gated on the explicit `kind` marker as well as on shape, so a decision line
+ * can never be mistaken for one and vice versa. A line that satisfies neither
+ * check is still counted as `skipped`, exactly as before.
+ */
+function isSqueezeRecord(value: unknown): value is SqueezeRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Partial<SqueezeRecord>;
+  if (record.kind !== "squeeze") return false;
+  const squeeze = record.squeeze as Partial<OperatorSqueeze> | undefined;
+  return (
+    typeof squeeze === "object" &&
+    squeeze !== null &&
+    typeof squeeze.id === "string" &&
+    squeeze.id !== "" &&
+    typeof squeeze.at === "number" &&
+    typeof squeeze.amountUsdfc === "string"
+  );
+}
+
+/**
  * The mode a line claims. Anything that is not literally "LIVE" — including a
  * record written before `mode` existed — reads as MOCK. Downgrading an unknown
  * record is the only safe default: a line may not be promoted into evidence by
  * being unreadable.
  */
-function recordMode(record: JournalRecord): AgentMode {
+function recordMode(record: JournalRecord | SqueezeRecord): AgentMode {
   return record.mode === "LIVE" ? "LIVE" : "MOCK";
 }
 
-/** Fold one file's text into `byId`, keeping the last record for each id. */
+/**
+ * Fold one file's text into `byId` (decisions) and `squeezesById` (operator
+ * withdrawals), keeping the last record for each id in either map.
+ *
+ * The two kinds share a file and a sequence and are separated here, on their
+ * own contents, so nothing downstream ever has to. `read` counts BOTH, which is
+ * what keeps `seq` monotonic across a file holding a mixture.
+ */
 function collect(
   text: string,
   byId: Map<string, JournalEntry>,
+  squeezesById: Map<string, SqueezeJournalEntry>,
 ): { read: number; skipped: number } {
   let skipped = 0;
   let read = 0;
@@ -329,6 +452,14 @@ function collect(
       skipped += 1;
       continue;
     }
+    if (isSqueezeRecord(parsed)) {
+      read += 1;
+      squeezesById.set(parsed.squeeze.id, {
+        mode: recordMode(parsed),
+        squeeze: parsed.squeeze,
+      });
+      continue;
+    }
     if (!isJournalRecord(parsed)) {
       skipped += 1;
       continue;
@@ -341,9 +472,16 @@ function collect(
   return { read, skipped };
 }
 
-/** Count, scope, sort and total a set of collected entries. */
+/**
+ * Count, scope, sort and total a set of collected entries.
+ *
+ * `byMode` counts DECISIONS only. It is what the "N MOCK decisions in this file
+ * were not restored" disclosure is derived from, and folding withdrawals into
+ * it would make that sentence say something untrue about the record.
+ */
 function finalize(
   byId: Map<string, JournalEntry>,
+  squeezesById: Map<string, SqueezeJournalEntry>,
   scope: JournalScope,
   read: number,
   skipped: number,
@@ -356,7 +494,22 @@ function finalize(
     .sort((a, b) => newestFirst(a.decision, b.decision));
   const decisions = entries.map((entry) => entry.decision);
 
-  return { decisions, entries, totals: totalsFor(decisions), byMode, scope, skipped, read };
+  const squeezeEntries = [...squeezesById.values()]
+    .filter((entry) => scope === null || entry.mode === scope)
+    .sort((a, b) => b.squeeze.at - a.squeeze.at || b.squeeze.id.localeCompare(a.squeeze.id));
+  const squeezes = squeezeEntries.map((entry) => entry.squeeze);
+
+  return {
+    decisions,
+    entries,
+    squeezes,
+    squeezeEntries,
+    totals: totalsFor(decisions),
+    byMode,
+    scope,
+    skipped,
+    read,
+  };
 }
 
 /**
@@ -368,8 +521,9 @@ function finalize(
  */
 export function parseJournal(text: string, scope: JournalScope = null): JournalLoad {
   const byId = new Map<string, JournalEntry>();
-  const { read, skipped } = collect(text, byId);
-  return finalize(byId, scope, read, skipped);
+  const squeezesById = new Map<string, SqueezeJournalEntry>();
+  const { read, skipped } = collect(text, byId, squeezesById);
+  return finalize(byId, squeezesById, scope, read, skipped);
 }
 
 /** A file read that could not be completed, with the reason. */
@@ -394,6 +548,7 @@ export interface JournalFilesLoad extends JournalLoad {
  */
 export function readJournalFiles(paths: string[], scope: JournalScope): JournalFilesLoad {
   const byId = new Map<string, JournalEntry>();
+  const squeezesById = new Map<string, SqueezeJournalEntry>();
   const files: string[] = [];
   const errors: JournalFileError[] = [];
   let read = 0;
@@ -410,12 +565,12 @@ export function readJournalFiles(paths: string[], scope: JournalScope): JournalF
       continue;
     }
     files.push(path);
-    const counted = collect(text, byId);
+    const counted = collect(text, byId, squeezesById);
     read += counted.read;
     skipped += counted.skipped;
   }
 
-  return { ...finalize(byId, scope, read, skipped), files, errors };
+  return { ...finalize(byId, squeezesById, scope, read, skipped), files, errors };
 }
 
 function errorMessage(error: unknown): string {
@@ -474,20 +629,43 @@ class FileDecisionJournal implements DecisionJournal {
   }
 
   append(decision: Decision): void {
+    this.writeLine((seq) => ({
+      v: JOURNAL_VERSION,
+      seq,
+      writtenAt: Date.now(),
+      mode: this.mode,
+      decision,
+    }));
+  }
+
+  /**
+   * One operator withdrawal, into the same file and the same sequence.
+   *
+   * Same file on purpose: the record of this account is one ordered history of
+   * everything that happened to it, and reading a squeeze in its true place
+   * among the decisions is exactly what makes "the operator caused this, the
+   * agent answered it" checkable months later. The `kind` marker is what keeps
+   * the two from ever being confused for one another on the way back in.
+   */
+  appendSqueeze(squeeze: OperatorSqueeze): void {
+    this.writeLine((seq) => ({
+      v: JOURNAL_VERSION,
+      kind: "squeeze",
+      seq,
+      writtenAt: Date.now(),
+      mode: this.mode,
+      squeeze,
+    }));
+  }
+
+  private writeLine(build: (seq: number) => JournalRecord | SqueezeRecord): void {
     if (!this.on) return;
     try {
       mkdirSync(dirname(this.path), { recursive: true });
       this.seq += 1;
-      const record: JournalRecord = {
-        v: JOURNAL_VERSION,
-        seq: this.seq,
-        writtenAt: Date.now(),
-        mode: this.mode,
-        decision,
-      };
       // Synchronous on purpose: it completes before the event loop turns, so
-      // two decisions written in the same tick cannot interleave their bytes.
-      appendFileSync(this.path, `${JSON.stringify(record)}\n`, "utf8");
+      // two records written in the same tick cannot interleave their bytes.
+      appendFileSync(this.path, `${JSON.stringify(build(this.seq))}\n`, "utf8");
     } catch (error) {
       this.disable(error);
     }
@@ -504,6 +682,7 @@ export function nullJournal(mode: AgentMode = "MOCK"): DecisionJournal {
     synchronous: true,
     load: (scope: JournalScope = mode) => emptyLoad(scope),
     append: () => undefined,
+    appendSqueeze: () => undefined,
   };
 }
 
