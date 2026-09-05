@@ -1,0 +1,43 @@
+# Drives the FilRunway agent's cycle in production.
+#
+# Deployed, the agent has no long-lived process: `/api/tick` runs exactly one
+# cycle per request and something external has to call it. Vercel Cron is the
+# natural driver, but this project is on a Hobby plan, where cron runs at most
+# once a day — too coarse to be an agent. So the real cadence lives here, and
+# `vercel.ts` keeps its daily cron only as a backstop.
+#
+# `/api/tick` can move funds, so it refuses anything without the deployment's
+# shared secret. Add CRON_SECRET under Settings -> Secrets and variables ->
+# Actions with the same value the Vercel project holds.
+#
+# GitHub's scheduled workflows are best-effort: runs can be delayed, or skipped
+# entirely, when the hosted-runner queue is busy. Treat five minutes as the
+# floor of the interval, not a guarantee.
+
+name: agent-tick
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: agent-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: POST /api/tick
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+               --max-time 300 \
+               --request POST \
+               --header "Authorization: Bearer $CRON_SECRET" \
+               https://filrunway.vercel.app/api/tick
